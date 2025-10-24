@@ -1,54 +1,150 @@
-name: Linux VPS
+name: Dynamic SOCKS5 Proxy via Cloudflare Tunnel
 
 on:
+  # Allows manual running from the GitHub Actions UI
   workflow_dispatch:
+    inputs:
+      socks_port:
+        description: 'Local port for microsocks'
+        default: '1080'
+        required: false
 
 jobs:
-  ubuntu-vps:
+  proxy:
+    # Runs on a fresh Ubuntu runner
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    
+    # Define required secrets for Cloudflare credentials and config
+    env:
+      SOCKS_PORT: ${{ github.event.inputs.socks_port || '1080' }}
+      MICRO_LOG: ${{ runner.temp }}/microsocks.log
+      TUNNEL_LOG: ${{ runner.temp }}/cloudflared_tunnel.log
+      
+    # Secrets required:
+    # CF_CREDS_JSON: Content of the Cloudflare creds.json (base64 encoded is safer, but raw JSON works too)
+    # CF_CONFIG_YML: Content of the Cloudflare config.yml
 
     steps:
-      # -------------------------------------------------
-      # 1. Create SSH User for VPS access
-      # -------------------------------------------------
-      - name: Setup SSH User
+      - name: 1. Cleanup & Setup
+        # Note: We skip most cleanup steps as GitHub Actions runs on a fresh environment.
         run: |
-          PASSWORD=$(openssl rand -base64 16)
-          echo "PASSWORD=$PASSWORD" >> $GITHUB_ENV
+          echo "SOCKS_PORT is set to $SOCKS_PORT"
+          pkill microsocks 2>/dev/null || true
+          pkill cloudflared 2>/dev/null || true
+          
+          # 2) Setup cloudflared directory and copy files
+          mkdir -p ~/.cloudflared/
+          
+          # Write credentials (CF_CREDS_JSON) and config (CF_CONFIG_YML) from secrets
+          echo "${{ secrets.CF_CREDS_JSON }}" > ~/.cloudflared/creds.json
+          echo "${{ secrets.CF_CONFIG_YML }}" > ~/.cloudflared/config.yml
+          
+          echo "✅ Cloudflare config files written from secrets."
 
-          sudo useradd -m -s /bin/bash vps
-          echo "vps:$PASSWORD" | sudo chpasswd
-          sudo usermod -aG sudo vps
-
-          echo "✅ User 'vps' created with a random password."
-
-      # -------------------------------------------------
-      # 2. Install & connect Tailscale for remote SSH
-      # -------------------------------------------------
-      - name: Install and Run Tailscale
+      - name: 2. Install Dependencies
+        # 3) Install dependencies
         run: |
-          curl -fsSL https://tailscale.com/install.sh | sh
-          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-ubuntu-runner
-          echo "✅ Tailscale connected."
+          echo "🌐 Installing packages..."
+          sudo apt-get update -y
+          sudo apt-get install -y git build-essential net-tools curl lsof
 
-      # -------------------------------------------------
-      # 3. Show SSH connection info
-      # -------------------------------------------------
-      - name: Display Connection Details & Keep Alive
+      - name: 3. Build and Install microsocks
+        # 4) Build microsocks
         run: |
-          TS_IP=$(tailscale ip -4)
-          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
-          echo "================================================="
-          echo "    SSH Connection Details"
-          echo "================================================="
-          echo "IP Address: $TS_IP"
-          echo "Username:   vps"
-          echo "Password:   ${{ env.PASSWORD }}"
-          echo ""
-          echo "To connect: ssh vps@$TS_IP"
-          echo "================================================="
-          for i in {1..60}; do
-            echo "[$(date)] Session active..."
-            sleep 300
+          echo "🌐 Cloning and building microsocks..."
+          git clone https://github.com/rofl0r/microsocks.git /tmp/microsocks
+          cd /tmp/microsocks
+          make
+          
+          # Install to /usr/local/bin
+          echo "Installing microsocks to /usr/local/bin/microsocks"
+          sudo cp -f microsocks /usr/local/bin/microsocks
+          sudo chmod +x /usr/local/bin/microsocks
+          
+          # Check installation
+          microsocks -h > /dev/null && echo "✅ microsocks installed successfully." || exit 1
+
+      - name: 4. Start microsocks (SOCKS5 Proxy)
+        # 5) Start microsocks
+        run: |
+          echo "🌐 Starting microsocks on 127.0.0.1:$SOCKS_PORT"
+          # Start in the background using nohup
+          nohup /usr/local/bin/microsocks -i 127.0.0.1 -p "$SOCKS_PORT" > "$MICRO_LOG" 2>&1 &
+          MICRO_PID=$!
+          
+          sleep 2
+          
+          if ps -p "$MICRO_PID" >/dev/null; then
+            echo "✅ microsocks started (PID $MICRO_PID)"
+          else
+            echo "❌ microsocks failed to start. Check $MICRO_LOG"
+            tail -n 50 "$MICRO_LOG"
+            exit 1
+          fi
+
+      - name: 5. Install cloudflared
+        # 6) Install cloudflared (if missing)
+        run: |
+          if ! command -v cloudflared >/dev/null 2>&1; then
+            echo "🌐 Installing cloudflared..."
+            curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cloudflared
+            sudo mv /tmp/cloudflared /usr/local/bin/cloudflared
+            sudo chmod +x /usr/local/bin/cloudflared
+          else
+            echo "✅ cloudflared already installed."
+          fi
+
+      - name: 6. Start Cloudflare Tunnel
+        # 7) Start cloudflared tunnel
+        run: |
+          echo "🌐 Starting cloudflared tunnel using config.yml..."
+          # Start in the background
+          nohup cloudflared tunnel run --config ~/.cloudflared/config.yml > "$TUNNEL_LOG" 2>&1 &
+          
+          CLOUDFLARED_PID=$!
+          sleep 10 # Wait longer for tunnel establishment
+          
+          if ps -p "$CLOUDFLARED_PID" >/dev/null; then
+            echo "✅ cloudflared started (PID $CLOUDFLARED_PID)"
+          else
+            echo "❌ cloudflared failed to start. Check $TUNNEL_LOG"
+            tail -n 50 "$TUNNEL_LOG"
+            exit 1
+          fi
+
+      - name: 7. Test Local SOCKS5 Connectivity
+        # 8) Quick test microsocks
+        run: |
+          echo "🌐 Testing local SOCKS5 proxy..."
+          IP=$(curl -s --max-time 10 --socks5-hostname 127.0.0.1:"$SOCKS_PORT" https://api.ipify.org || echo "FAIL")
+
+          if [[ $IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "✅ Proxy test OK — external IP via proxy: $IP"
+          else
+            echo "❌ Proxy test failed. IP returned: $IP"
+            exit 1
+          fi
+          
+      - name: 8. Keep Alive and Monitor Services
+        # 8) Keep alive and monitor (The final, crucial step to keep the job running)
+        run: |
+          echo "=========================================================="
+          echo "🌐 Services are running. This job will continue until timeout."
+          echo "Check your Cloudflare Access policy for the hostname (it must be 'Bypass')."
+          echo "=========================================================="
+          
+          # The infinite loop that keeps the job alive while the background processes run
+          while true; do
+            MICRO_COUNT=$(pgrep microsocks | wc -l)
+            CLOUDFLARE_COUNT=$(pgrep cloudflared | wc -l)
+            
+            if [ "$MICRO_COUNT" -eq 0 ] || [ "$CLOUDFLARE_COUNT" -eq 0 ]; then
+              echo "🚨 $(date) - A critical service has stopped. Exiting job."
+              pgrep microsocks || tail -n 20 "$MICRO_LOG"
+              pgrep cloudflared || tail -n 20 "$TUNNEL_LOG"
+              exit 1
+            fi
+            
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - microsocks: Running ($MICRO_COUNT) | cloudflared: Running ($CLOUDFLARE_COUNT)"
+            sleep 60
           done
