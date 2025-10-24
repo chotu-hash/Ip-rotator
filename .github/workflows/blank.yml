@@ -10,7 +10,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt update -y
-          sudo apt install -y git build-essential net-tools jq
+          sudo apt install -y git build-essential net-tools jq curl lsof
 
       - name: Build microsocks with debugging
         run: |
@@ -18,53 +18,54 @@ jobs:
           cd microsocks
           make
           sudo cp microsocks /usr/local/bin/
-          # Test if microsocks works
           microsocks -h || echo "microsocks help test"
           echo "✅ microsocks built and installed"
 
-      - name: Start local SOCKS5 proxy with error handling
+      - name: Ensure SOCKS5 user exists
         run: |
-          # Kill any existing microsocks processes
+          sudo useradd -M -s /usr/sbin/nologin proxyuser || true
+          echo "✅ User 'proxyuser' ready for SOCKS5"
+
+      - name: Start local SOCKS5 proxy
+        run: |
+          # Kill any existing microsocks
           pkill microsocks 2>/dev/null || true
           sleep 2
-          
-          # Start microsocks with explicit output
+
+          # Ensure port 1080 is free
+          if sudo lsof -i :1080; then
+            echo "❌ Port 1080 is in use, cannot start microsocks"
+            exit 1
+          fi
+
           echo "Starting microsocks..."
-          microsocks -i 127.0.0.1 -p 1080 -u proxyuser -P proxypass -v &
+          nohup microsocks -i 127.0.0.1 -p 1080 -u proxyuser -P proxypass -v > microsocks.log 2>&1 &
           MICROSOCKS_PID=$!
           echo "microsocks PID: $MICROSOCKS_PID"
-          
-          # Wait and check if it's running
+
+          # Wait a few seconds and check status
           sleep 5
-          echo "=== Process Status ==="
-          ps -p $MICROSOCKS_PID >/dev/null && echo "✅ microsocks process running" || echo "❌ microsocks process died"
-          
-          echo "=== Network Status (as root) ==="
-          sudo netstat -tlnp | grep 1080 || echo "No port 1080 listening (may need root)"
-          
-          echo "=== Network Status (as user) ==="
-          netstat -tln | grep 1080 || echo "Port 1080 not visible to user"
-          
-          # Alternative port check
-          echo "=== Alternative Port Check ==="
-          nc -zv 127.0.0.1 1080 && echo "✅ Port 1080 is open" || echo "❌ Port 1080 is not accessible"
+          if ps -p $MICROSOCKS_PID >/dev/null; then
+            echo "✅ microsocks process running"
+          else
+            echo "❌ microsocks failed to start, see microsocks.log"
+            tail -20 microsocks.log
+            exit 1
+          fi
 
       - name: Test SOCKS5 functionality
         run: |
           echo "=== Testing SOCKS5 Connection ==="
-          # Wait a bit more for microsocks to fully start
           sleep 3
-          
-          # Test with timeout and better error handling
           timeout 10 bash -c '
             if curl -v --socks5 127.0.0.1:1080 -U proxyuser:proxypass http://httpbin.org/ip 2>&1 | grep -q "origin"; then
               echo "✅ SOCKS5 HTTP test PASSED"
             else
               echo "❌ SOCKS5 HTTP test FAILED"
+              tail -20 microsocks.log
+              exit 1
             fi
-          ' || echo "⚠️  SOCKS5 test timed out or failed"
-          
-          # Check microsocks process again
+          '
           echo "=== microsocks Process Check ==="
           pgrep microsocks && echo "✅ microsocks still running" || echo "❌ microsocks not running"
 
@@ -73,6 +74,7 @@ jobs:
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
           sudo mv cloudflared /usr/local/bin/cloudflared
           sudo chmod +x /usr/local/bin/cloudflared
+          echo "✅ cloudflared installed"
 
       - name: Setup Cloudflare tunnel
         env:
@@ -80,7 +82,7 @@ jobs:
         run: |
           mkdir -p ~/.cloudflared/
           echo "$TUNNEL_CREDS" > ~/.cloudflared/creds.json
-          
+
           cat > ~/.cloudflared/config.yml << EOF
           tunnel: d09d85ca-86ef-45e3-b340-9f00d90b6244
           credentials-file: /home/runner/.cloudflared/creds.json
@@ -89,37 +91,33 @@ jobs:
               service: tcp://localhost:1080
             - service: http_status:404
           EOF
+          echo "✅ Cloudflare tunnel config ready"
 
       - name: Start Cloudflare tunnel
         run: |
           pkill cloudflared 2>/dev/null || true
           sleep 2
-          
           echo "Starting Cloudflare tunnel..."
           nohup cloudflared tunnel run > tunnel.log 2>&1 &
+          CLOUDFLARE_PID=$!
           sleep 30
-          
-          echo "=== Tunnel Status ==="
-          cloudflared tunnel list 2>&1 | head -10
-          echo "=== Tunnel Log ==="
+          ps -p $CLOUDFLARE_PID >/dev/null && echo "✅ cloudflared running" || echo "❌ cloudflared failed, see tunnel.log"
           tail -20 tunnel.log
 
       - name: Final verification
         run: |
           echo "=== Final Service Status ==="
-          echo "microsocks: $(pgrep microsocks && echo 'RUNNING' || echo 'STOPPED')"
-          echo "cloudflared: $(pgrep cloudflared && echo 'RUNNING' || echo 'STOPPED')"
-          
-          echo "=== Testing End-to-End ==="
-          echo "If both services are running, test from your local machine:"
+          echo "microsocks: $(pgrep microsocks >/dev/null && echo 'RUNNING' || echo 'STOPPED')"
+          echo "cloudflared: $(pgrep cloudflared >/dev/null && echo 'RUNNING' || echo 'STOPPED')"
+          echo ""
+          echo "Test from your local machine:"
           echo "curl --socks5-hostname proxy.trendscoop.xyz:443 -U proxyuser:proxypass https://ifconfig.me"
 
-      - name: Keep alive
+      - name: Keep alive and monitor services
         run: |
           echo "🌐 SERVICES MONITORING"
           echo "microsocks (SOCKS5) → 127.0.0.1:1080"
           echo "cloudflared (Tunnel) → proxy.trendscoop.xyz:443"
-          echo ""
           while true; do
             MICRO_RUNNING=$(pgrep microsocks >/dev/null && echo "✅" || echo "❌")
             CLOUDFLARE_RUNNING=$(pgrep cloudflared >/dev/null && echo "✅" || echo "❌")
