@@ -56,17 +56,29 @@ jobs:
         run: |
           echo "=== Testing SOCKS5 Connection ==="
           sleep 3
-          timeout 10 bash -c '
-            if curl -v --socks5 127.0.0.1:1080 -U proxyuser:proxypass http://httpbin.org/ip 2>&1 | grep -q "origin"; then
-              echo "✅ SOCKS5 HTTP test PASSED"
+          
+          timeout 15 bash -c '
+            # Use HTTPS and --socks5-hostname for proper hostname resolution
+            RESPONSE=$(curl -s --socks5-hostname 127.0.0.1:1080 -U proxyuser:proxypass https://api.ipify.org)
+            if [[ $RESPONSE =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "✅ SOCKS5 HTTPS test PASSED (IP: $RESPONSE)"
             else
-              echo "❌ SOCKS5 HTTP test FAILED"
+              echo "❌ SOCKS5 HTTPS test FAILED"
+              echo "=== Last 20 lines of microsocks.log ==="
               tail -20 microsocks.log
               exit 1
             fi
           '
+          
           echo "=== microsocks Process Check ==="
-          pgrep microsocks && echo "✅ microsocks still running" || echo "❌ microsocks not running"
+          if pgrep microsocks >/dev/null; then
+            echo "✅ microsocks still running"
+          else
+            echo "❌ microsocks not running"
+            tail -20 microsocks.log
+            exit 1
+          fi
+
 
       - name: Install cloudflared
         run: |
