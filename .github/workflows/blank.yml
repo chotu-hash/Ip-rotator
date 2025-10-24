@@ -10,11 +10,16 @@ jobs:
       - name: Install microsocks
         run: |
           sudo apt update -y
-          sudo apt install -y git build-essential curl wget
+          sudo apt install -y git build-essential
           git clone https://github.com/rofl0r/microsocks.git
           cd microsocks && make
           sudo cp microsocks /usr/local/bin/
-          nohup microsocks -p 1080 -u proxyuser -P proxypass &
+
+      - name: Start SOCKS5 proxy (bind to all interfaces)
+        run: |
+          nohup microsocks -i 0.0.0.0 -p 1080 -u proxyuser -P proxypass > socks.log 2>&1 &
+          sleep 5
+          netstat -tlnp | grep 1080 || echo "SOCKS not listening"
 
       - name: Install Cloudflare Tunnel
         run: |
@@ -22,15 +27,28 @@ jobs:
           sudo mv cloudflared /usr/local/bin/cloudflared
           sudo chmod +x /usr/local/bin/cloudflared
 
-      - name: Start Cloudflare Tunnel
-        env:
-          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+      - name: Create tunnel configuration
         run: |
-          nohup cloudflared tunnel run --token "$CF_TUNNEL_TOKEN" > tunnel.log 2>&1 &
-          echo "✅ Tunnel started"
+          cat > tunnel.yml << EOF
+          tunnel: socks5-tunnel
+          credentials-file: /root/.cloudflared/credentials.json
+          ingress:
+            - hostname: proxy.trendscoop.xyz
+              service: tcp://localhost:1080
+            - service: http_status:404
+          EOF
+          sudo mkdir -p /root/.cloudflared/
+          echo "${{ secrets.CF_TUNNEL_CREDENTIALS }}" | sudo tee /root/.cloudflared/credentials.json > /dev/null
 
-      - name: Keep alive (cancel manually when done)
+      - name: Start Cloudflare Tunnel
         run: |
-          echo "🌐 Proxy active. Keep this job running to use it."
-          echo "To stop, cancel workflow manually."
+          sudo nohup cloudflared tunnel --config tunnel.yml run socks5-tunnel > tunnel.log 2>&1 &
+          sleep 10
+          echo "Tunnel started"
+          cat tunnel.log || echo "No tunnel log yet"
+
+      - name: Keep alive
+        run: |
+          echo "🌐 SOCKS5 Proxy active via Cloudflare Tunnel"
+          echo "Use: curl --socks5 proxy.trendscoop.xyz:1080 -U proxyuser:proxypass https://ifconfig.me"
           sleep 24h
