@@ -69,8 +69,8 @@ jobs:
         # 5) Start microsocks
         run: |
           echo "🌐 Starting microsocks on 127.0.0.1:$SOCKS_PORT"
-          # Start in the background using nohup
-          nohup /usr/local/bin/microsocks -i 127.0.0.1 -p "$SOCKS_PORT" > "$MICRO_LOG" 2>&1 &
+          # FIX: Added -q (quiet) option to disable logging for stability in background mode
+          nohup /usr/local/bin/microsocks -q -i 127.0.0.1 -p "$SOCKS_PORT" > "$MICRO_LOG" 2>&1 &
           MICRO_PID=$!
           
           sleep 2
