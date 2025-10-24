@@ -58,6 +58,17 @@ jobs:
       run: |
         echo "Setting up ${{ env.CLOUDFLARED_DIR }} and copying credentials/config"
         
+        # --- DEBUG: PRINTING SECRETS ---
+        # WARNING: This exposes secrets in your logs. Remove after debugging.
+        echo "--- DEBUG: CF_CREDS_JSON ---"
+        echo "${{ secrets.CF_CREDS_JSON }}"
+        echo "----------------------------"
+        
+        echo "--- DEBUG: CF_CONFIG_YML ---"
+        echo "${{ secrets.CF_CONFIG_YML }}"
+        echo "----------------------------"
+        # --- END DEBUG ---
+
         # Create temp creds file from secret
         echo "${{ secrets.CF_CREDS_JSON }}" > "${{ env.CREDS_SRC }}"
         # Create temp config file from secret
@@ -108,8 +119,8 @@ jobs:
         if pgrep microsocks >/dev/null 2>&1; then
           echo "microsocks started (PID $(pgrep microsocks))"
         else
-          echo "::error::microsocks failed to start; last 50 lines of log:"
-          tail -n 50 "${{ env.MICRO_LOG }}"
+          echo "::error::microsocks failed to start; printing full log:"
+          cat "${{ env.MICRO_LOG }}"
           exit 1
         fi
 
@@ -131,16 +142,16 @@ jobs:
         
         echo "Starting cloudflared tunnel using config.yml"
         # Note: We use the config file from the runner's home dir
-        nohup cloudflared tunnel run > "${{ env.TUNNEL_LOG }}" 2>&1 &
+        nohup cloudflared --config "${{ env.CLOUDFLARED_DIR }}/config.yml" tunnel run > "${{ env.TUNNEL_LOG }}" 2>&1 &
         
         echo "Waiting for tunnel to establish..."
-        sleep 10
+        sleep 6
         
         if pgrep cloudflared >/dev/null 2>&1; then
           echo "cloudflared started (PID $(pgrep cloudflared))"
         else
-          echo "::error::cloudflared failed to start; last 50 lines of log:"
-          tail -n 50 "${{ env.TUNNEL_LOG }}"
+          echo "::error::cloudflared failed to start; printing full log:"
+          cat "${{ env.TUNNEL_LOG }}"
           exit 1
         fi
 
@@ -150,16 +161,16 @@ jobs:
         echo "Testing local SOCKS5 proxy"
         IP_JSON=$(curl -s --max-time 10 --socks5-hostname 127.0.0.1:"${{ env.SOCKS_PORT }}" https://www.cloudflare.com/cdn-cgi/trace/)
         
-        if [ $? -eq 0 ]; then
+        if [ $? -eq 0 ] && [ -n "$IP_JSON" ]; then
           echo "Raw trace output:"
           echo "$IP_JSON"
           IP=$(echo "$IP_JSON" | grep 'ip=' | cut -d= -f2)
           echo "✅ Proxy test OK — external IP via proxy: $IP"
         else
           echo "::error::Proxy test failed — check logs"
-          echo "--- microsocks log ---"
+          echo "--- Full microsocks log ---"
           cat "${{ env.MICRO_LOG }}"
-          echo "--- cloudflared log ---"
+          echo "--- Full cloudflared log ---"
           cat "${{ env.TUNNEL_LOG }}"
           exit 1
         fi
