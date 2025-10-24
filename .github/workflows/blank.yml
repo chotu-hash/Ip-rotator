@@ -85,6 +85,17 @@ jobs:
         rm -f "${{ env.CREDS_SRC }}"
         rm -f "config.yml.temp"
 
+        # --- DEBUG: PRINTING FINAL FILES ---
+        # WARNING: This exposes secrets in your logs. Remove after debugging.
+        echo "--- DEBUG: Content of /home/runner/.cloudflared/creds.json ---"
+        cat "${{ env.CLOUDFLARED_DIR }}/creds.json"
+        echo "-------------------------------------------------------------"
+        
+        echo "--- DEBUG: Content of /home/runner/.cloudflared/config.yml ---"
+        cat "${{ env.CLOUDFLARED_DIR }}/config.yml"
+        echo "--------------------------------------------------------------"
+        # --- END DEBUG ---
+
     - name: 3) Install dependencies
       shell: bash
       run: |
@@ -182,4 +193,6 @@ jobs:
         echo "Add subsequent steps to this job to use them."
         # For example, to keep the job alive for 10 minutes:
         # sleep 600
+
+
 
