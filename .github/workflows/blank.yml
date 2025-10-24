@@ -7,48 +7,83 @@ jobs:
   proxy:
     runs-on: ubuntu-latest
     steps:
-      - name: Install microsocks
+      - name: Install dependencies
         run: |
           sudo apt update -y
-          sudo apt install -y git build-essential
+          sudo apt install -y git build-essential net-tools jq
+
+      - name: Install and start microsocks
+        run: |
           git clone https://github.com/rofl0r/microsocks.git
           cd microsocks && make
           sudo cp microsocks /usr/local/bin/
+          # Start microsocks binding to localhost only (more secure)
+          nohup microsocks -i 127.0.0.1 -p 1080 -u proxyuser -P proxypass > socks.log 2>&1 &
+          sleep 3
+          echo "=== SOCKS5 Status ==="
+          netstat -tlnp | grep 1080 || echo "SOCKS5 not listening"
 
-      - name: Start SOCKS5 proxy (bind to all interfaces)
-        run: |
-          nohup microsocks -i 0.0.0.0 -p 1080 -u proxyuser -P proxypass > socks.log 2>&1 &
-          sleep 5
-          netstat -tlnp | grep 1080 || echo "SOCKS not listening"
-
-      - name: Install Cloudflare Tunnel
+      - name: Install cloudflared
         run: |
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
           sudo mv cloudflared /usr/local/bin/cloudflared
           sudo chmod +x /usr/local/bin/cloudflared
 
-      - name: Create tunnel configuration
+      - name: Setup tunnel configuration
+        env:
+          TUNNEL_CREDS: ${{ secrets.CF_TUNNEL_CREDENTIALS }}
         run: |
-          cat > tunnel.yml << EOF
-          tunnel: socks5-tunnel
-          credentials-file: /root/.cloudflared/credentials.json
+          mkdir -p ~/.cloudflared/
+          echo "$TUNNEL_CREDS" > ~/.cloudflared/creds.json
+          
+          TUNNEL_ID=$(jq -r '.TunnelID' ~/.cloudflared/creds.json)
+          echo "Tunnel ID: $TUNNEL_ID"
+          
+          # Create config file - pointing to localhost (correct)
+          cat > ~/.cloudflared/config.yml << EOF
+          tunnel: $TUNNEL_ID
+          credentials-file: /home/runner/.cloudflared/creds.json
           ingress:
             - hostname: proxy.trendscoop.xyz
               service: tcp://localhost:1080
             - service: http_status:404
           EOF
-          sudo mkdir -p /root/.cloudflared/
-          echo "${{ secrets.CF_TUNNEL_CREDENTIALS }}" | sudo tee /root/.cloudflared/credentials.json > /dev/null
+          
+          echo "=== Config File ==="
+          cat ~/.cloudflared/config.yml
 
       - name: Start Cloudflare Tunnel
         run: |
-          sudo nohup cloudflared tunnel --config tunnel.yml run socks5-tunnel > tunnel.log 2>&1 &
-          sleep 10
-          echo "Tunnel started"
-          cat tunnel.log || echo "No tunnel log yet"
+          nohup cloudflared tunnel run > tunnel.log 2>&1 &
+          sleep 15
+          
+          echo "=== Tunnel Log (last 20 lines) ==="
+          tail -20 tunnel.log || echo "No tunnel log yet"
+
+      - name: Test SOCKS5 proxy locally
+        run: |
+          echo "=== Testing SOCKS5 locally ==="
+          timeout 10 curl -v --socks5 127.0.0.1:1080 -U proxyuser:proxypass http://ifconfig.me 2>&1 | head -30 || echo "Local test completed"
+
+      - name: Debug information
+        run: |
+          echo "=== Network Connections ==="
+          netstat -tlnp | grep -E '(1080|cloudflared)' || echo "No relevant connections"
+          echo "=== Running Processes ==="
+          ps aux | grep -E '(microsocks|cloudflared)' | grep -v grep
 
       - name: Keep alive
         run: |
-          echo "🌐 SOCKS5 Proxy active via Cloudflare Tunnel"
-          echo "Use: curl --socks5 proxy.trendscoop.xyz:1080 -U proxyuser:proxypass https://ifconfig.me"
-          sleep 24h
+          echo "🌐 SOCKS5 Proxy Setup Complete"
+          echo ""
+          echo "✅ Use this command from your local machine:"
+          echo "curl --socks5-hostname proxy.trendscoop.xyz:443 -U proxyuser:proxypass https://ifconfig.me"
+          echo ""
+          echo "🔍 If it doesn't work, check:"
+          echo "1. DNS is pointing to Cloudflare (proxy.trendscoop.xyz)"
+          echo "2. Tunnel is connected (check workflow logs)"
+          echo "3. Using port 443, not 1080"
+          while true; do
+            echo "$(date): Proxy running..." 
+            sleep 60
+          done
