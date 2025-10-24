@@ -1,4 +1,4 @@
-name: HTTP/HTTPS Proxy via Cloudflare
+name: Local SOCKS5 + Cloudflare Tunnel
 
 on:
   workflow_dispatch:
@@ -7,88 +7,41 @@ jobs:
   proxy:
     runs-on: ubuntu-latest
     steps:
-      - name: Install Squid Proxy
+      - name: Install dependencies
         run: |
           sudo apt update -y
-          sudo apt install -y squid jq apache2-utils
+          sudo apt install -y git build-essential net-tools jq
 
-      - name: Configure Squid
+      - name: Build and install microsocks
         run: |
-          # Stop any running Squid first
-          sudo systemctl stop squid 2>/dev/null || true
-          sudo pkill squid 2>/dev/null || true
-          sleep 2
-          
-          # Create password file using htpasswd
-          sudo htpasswd -b -c /etc/squid/passwords proxyuser proxypass
-          sudo chown proxy:proxy /etc/squid/passwords
+          git clone https://github.com/rofl0r/microsocks.git
+          cd microsocks
+          make
+          sudo cp microsocks /usr/local/bin/
+          echo "✅ microsocks installed"
 
-          # Modern Squid configuration
-          sudo tee /etc/squid/squid.conf > /dev/null << 'EOF'
-          http_port 3128
+      - name: Start local SOCKS5 proxy
+        run: |
+          # Start microsocks binding only to localhost (more secure)
+          nohup microsocks -i 127.0.0.1 -p 1080 -u proxyuser -P proxypass -v > socks.log 2>&1 &
           
-          # Basic settings
-          cache deny all
-          forwarded_for delete
-          via off
-          
-          # Authentication
-          auth_param basic program /usr/lib/squid/basic_ncsa_auth /etc/squid/passwords
-          auth_param basic realm "Squid Proxy"
-          auth_param basic credentialsttl 2 hours
-          acl authenticated proxy_auth REQUIRED
-          
-          # ACLs for security
-          acl localnet src 0.0.0.1-0.255.255.255  # RFC 1122 "this" network (LAN)
-          acl localnet src 10.0.0.0/8             # RFC 1918 local private network (LAN)
-          acl localnet src 100.64.0.0/10          # RFC 6598 shared address space (CGN)
-          acl localnet src 169.254.0.0/16         # RFC 3927 link-local (direct plug-in)
-          acl localnet src 172.16.0.0/12          # RFC 1918 local private network (LAN)
-          acl localnet src 192.168.0.0/16         # RFC 1918 local private network (LAN)
-          acl localnet src fc00::/7                # RFC 4193 local private network range
-          acl localnet src fe80::/10               # RFC 4291 link-local (direct plug-in)
-          
-          acl SSL_ports port 443
-          acl Safe_ports port 80          # http
-          acl Safe_ports port 21          # ftp
-          acl Safe_ports port 443         # https
-          acl Safe_ports port 70          # gopher
-          acl Safe_ports port 210         # wais
-          acl Safe_ports port 1025-65535  # unregistered ports
-          acl Safe_ports port 280         # http-mgmt
-          acl Safe_ports port 488         # gss-http
-          acl Safe_ports port 591         # filemaker
-          acl Safe_ports port 777         # multiling http
-          acl CONNECT method CONNECT
-          
-          # Default access rules
-          http_access deny !Safe_ports
-          http_access deny CONNECT !SSL_ports
-          http_access allow localhost
-          http_access allow authenticated
-          http_access deny all
-          
-          # Leave via off for anonymity but handle the warning
-          via off
-          EOF
+          sleep 3
+          echo "=== Local SOCKS5 Status ==="
+          netstat -tlnp | grep 1080 || echo "SOCKS5 not listening"
+          echo "=== Process Check ==="
+          ps aux | grep microsocks | grep -v grep
 
-          # Create cache directories
-          sudo mkdir -p /var/cache/squid
-          sudo mkdir -p /var/log/squid
-          sudo chown -R proxy:proxy /var/cache/squid /var/log/squid
-
-          # Initialize cache (non-interactive)
-          sudo squid -z 2>/dev/null || true
+      - name: Test local SOCKS5 proxy
+        run: |
+          echo "=== Testing Local SOCKS5 ==="
+          # Test HTTP
+          timeout 10 curl -v --socks5 127.0.0.1:1080 -U proxyuser:proxypass http://httpbin.org/ip 2>&1 | grep -E "(SOCKS5|Connected|HTTP|ip)" || echo "HTTP test completed"
           
-          # Start Squid
-          sudo systemctl start squid
-          sudo systemctl enable squid
+          # Test HTTPS
+          timeout 10 curl -v --socks5 127.0.0.1:1080 -U proxyuser:proxypass https://httpbin.org/ip 2>&1 | grep -E "(SOCKS5|Connected|HTTP|ip)" || echo "HTTPS test completed"
           
-          sleep 5
-          echo "=== Squid Status ==="
-          sudo systemctl status squid --no-pager | head -10
-          echo "=== Network Ports ==="
-          sudo netstat -tlnp | grep 3128 || echo "Squid port check"
+          echo "=== microsocks Log ==="
+          tail -10 socks.log || echo "No log yet"
 
       - name: Install cloudflared
         run: |
@@ -96,87 +49,88 @@ jobs:
           sudo mv cloudflared /usr/local/bin/cloudflared
           sudo chmod +x /usr/local/bin/cloudflared
 
-      - name: Setup tunnel configuration
+      - name: Setup Cloudflare tunnel for local SOCKS5
         env:
           TUNNEL_CREDS: ${{ secrets.CF_TUNNEL_CREDENTIALS }}
         run: |
           mkdir -p ~/.cloudflared/
           echo "$TUNNEL_CREDS" > ~/.cloudflared/creds.json
           
-          # Create config
+          # Tunnel config that points to local SOCKS5
           cat > ~/.cloudflared/config.yml << EOF
           tunnel: d09d85ca-86ef-45e3-b340-9f00d90b6244
           credentials-file: /home/runner/.cloudflared/creds.json
           ingress:
+            # TCP tunnel for SOCKS5 protocol
             - hostname: proxy.trendscoop.xyz
-              service: http://localhost:3128
+              service: tcp://localhost:1080
+            # Fallback
             - service: http_status:404
           EOF
           
-          echo "✅ Tunnel configuration created"
+          echo "✅ Tunnel configured for local SOCKS5 proxy"
 
-      - name: Start Cloudflare Tunnel
+      - name: Start Cloudflare tunnel
         run: |
-          # Stop any existing cloudflared
+          # Stop any existing tunnels
           pkill cloudflared 2>/dev/null || true
           sleep 2
           
-          # Start tunnel
+          # Start tunnel (will expose local SOCKS5 to the internet)
           nohup cloudflared tunnel run > tunnel.log 2>&1 &
-          sleep 25
+          sleep 30  # Give more time for tunnel establishment
           
           echo "=== Tunnel Status ==="
-          cloudflared tunnel list 2>&1 | head -10 || echo "Tunnel list completed"
-          echo "=== Recent Logs ==="
-          tail -10 tunnel.log
+          cloudflared tunnel list 2>&1 | head -10
+          echo "=== Tunnel Log ==="
+          tail -20 tunnel.log
 
-      - name: Test proxy locally
+      - name: Verify setup
         run: |
-          echo "=== Testing HTTP Proxy Locally ==="
-          timeout 10 curl -s --proxy http://proxyuser:proxypass@127.0.0.1:3128 http://httpbin.org/ip || echo "HTTP test completed"
-          
-          echo "=== Testing HTTPS Proxy Locally ==="
-          timeout 10 curl -s --proxy http://proxyuser:proxypass@127.0.0.1:3128 https://httpbin.org/ip || echo "HTTPS test completed"
-
-      - name: Final verification
-        run: |
-          echo "=== Service Status ==="
-          sudo systemctl is-active squid && echo "✅ Squid: RUNNING" || echo "❌ Squid: STOPPED"
+          echo "=== Final Verification ==="
+          echo "Local Services:"
+          pgrep microsocks >/dev/null && echo "✅ microsocks (127.0.0.1:1080): RUNNING" || echo "❌ microsocks: STOPPED"
           pgrep cloudflared >/dev/null && echo "✅ Cloudflare Tunnel: RUNNING" || echo "❌ Cloudflare Tunnel: STOPPED"
           
-          echo "=== Network Verification ==="
-          sudo netstat -tlnp | grep 3128 && echo "✅ Squid listening on 3128" || echo "❌ Squid not listening"
+          echo "Network Status:"
+          netstat -tlnp | grep 1080 && echo "✅ SOCKS5 listening locally" || echo "❌ SOCKS5 not listening"
+          
+          echo "=== Architecture ==="
+          echo "microsocks ───► 127.0.0.1:1080 (local only)"
+          echo "cloudflared ──► proxy.trendscoop.xyz:443 ───► 127.0.0.1:1080"
 
-      - name: Keep alive with usage instructions
+      - name: Keep alive with monitoring
         run: |
-          echo "🌐 HTTP/HTTPS PROXY READY"
+          echo "🌐 LOCAL SOCKS5 + CLOUDFLARE TUNNEL ACTIVE"
           echo "=========================================="
           echo ""
-          echo "🚀 USAGE COMMANDS:"
+          echo "🏗️  ARCHITECTURE:"
+          echo "microsocks bound to: 127.0.0.1:1080 (localhost only)"
+          echo "Cloudflare Tunnel exposes: proxy.trendscoop.xyz:443"
+          echo "Tunnel forwards to: localhost:1080"
           echo ""
-          echo "For HTTP websites:"
-          echo "curl --proxy http://proxyuser:proxypass@proxy.trendscoop.xyz:80 http://ifconfig.me"
+          echo "🚀 USAGE:"
+          echo "curl --socks5-hostname proxy.trendscoop.xyz:443 -U proxyuser:proxypass https://ifconfig.me"
           echo ""
-          echo "For HTTPS websites:"
-          echo "curl --proxy http://proxyuser:proxypass@proxy.trendscoop.xyz:443 https://ifconfig.me"
+          echo "🔧 SECURITY:"
+          echo "✅ SOCKS5 only accessible locally"
+          echo "✅ Cloudflare handles external access"
+          echo "✅ Authentication required"
           echo ""
-          echo "Alternative syntax:"
-          echo "curl -x http://proxyuser:proxypass@proxy.trendscoop.xyz:443 https://ifconfig.me"
-          echo ""
-          echo "=========================================="
-          echo "🔧 CONFIGURATION:"
-          echo "Proxy Server: proxy.trendscoop.xyz"
-          echo "Port: 80 (HTTP) or 443 (HTTPS)"
-          echo "Username: proxyuser"
-          echo "Password: proxypass"
-          echo ""
-          echo "📊 Monitoring..."
+          echo "📊 Monitoring local services..."
           COUNTER=0
           while true; do
-            echo "$(date) - Proxy active for $((COUNTER * 60)) seconds"
-            # Quick service check
-            sudo systemctl is-active squid >/dev/null && echo "✅ Squid OK" || echo "❌ Squid DOWN"
-            pgrep cloudflared >/dev/null && echo "✅ Tunnel OK" || echo "❌ Tunnel DOWN"
+            echo "$(date) - Services running for $((COUNTER * 60)) seconds"
+            if pgrep microsocks >/dev/null; then
+              echo "✅ microsocks: ACTIVE (PID: $(pgrep microsocks))"
+            else
+              echo "❌ microsocks: INACTIVE"
+            fi
+            if pgrep cloudflared >/dev/null; then
+              echo "✅ cloudflared: ACTIVE (PID: $(pgrep cloudflared))"
+            else
+              echo "❌ cloudflared: INACTIVE"
+            fi
             echo "---"
             COUNTER=$((COUNTER + 1))
             sleep 60
