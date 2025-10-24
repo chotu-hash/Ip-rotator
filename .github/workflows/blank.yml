@@ -80,7 +80,7 @@ jobs:
         
         sudo mkdir -p "${{ env.CLOUDFLARED_DIR }}"
         sudo cp -f "${{ env.CREDS_SRC }}" "${{ env.CLOUDFLARED_DIR }}/creds.json"
-        sudo cp -f "config.yml.temp" "${{ env.CLOUFLARED_DIR }}/config.yml"
+        sudo cp -f "config.yml.temp" "${{ env.CLOUDFLARED_DIR }}/config.yml"
         
         # Set ownership to the runner user
         sudo chown -R "$(whoami)":"$(whoami)" "${{ env.CLOUDFLARED_DIR }}"
