@@ -7,18 +7,23 @@ jobs:
   proxy:
     runs-on: ubuntu-latest
     steps:
-      - name: Install dependencies
+      - name: Install Squid Proxy
         run: |
           sudo apt update -y
-          sudo apt install -y squid jq curl
+          sudo apt install -y squid jq apache2-utils
 
-      - name: Configure Squid for HTTP/HTTPS
+      - name: Configure Squid
         run: |
-          # Create password file
-          echo "proxyuser:$(openssl passwd -crypt proxypass)" | sudo tee /etc/squid/passwords
+          # Stop any running Squid first
+          sudo systemctl stop squid 2>/dev/null || true
+          sudo pkill squid 2>/dev/null || true
+          sleep 2
+          
+          # Create password file using htpasswd
+          sudo htpasswd -b -c /etc/squid/passwords proxyuser proxypass
           sudo chown proxy:proxy /etc/squid/passwords
 
-          # Configure Squid
+          # Modern Squid configuration
           sudo tee /etc/squid/squid.conf > /dev/null << 'EOF'
           http_port 3128
           
@@ -26,66 +31,70 @@ jobs:
           cache deny all
           forwarded_for delete
           via off
-          dns_v4_first on
           
           # Authentication
           auth_param basic program /usr/lib/squid/basic_ncsa_auth /etc/squid/passwords
           auth_param basic realm "Squid Proxy"
           auth_param basic credentialsttl 2 hours
-          auth_param basic casesensitive off
-          
-          # ACLs
           acl authenticated proxy_auth REQUIRED
+          
+          # ACLs for security
+          acl localnet src 0.0.0.1-0.255.255.255  # RFC 1122 "this" network (LAN)
+          acl localnet src 10.0.0.0/8             # RFC 1918 local private network (LAN)
+          acl localnet src 100.64.0.0/10          # RFC 6598 shared address space (CGN)
+          acl localnet src 169.254.0.0/16         # RFC 3927 link-local (direct plug-in)
+          acl localnet src 172.16.0.0/12          # RFC 1918 local private network (LAN)
+          acl localnet src 192.168.0.0/16         # RFC 1918 local private network (LAN)
+          acl localnet src fc00::/7                # RFC 4193 local private network range
+          acl localnet src fe80::/10               # RFC 4291 link-local (direct plug-in)
+          
           acl SSL_ports port 443
-          acl Safe_ports port 80
-          acl Safe_ports port 443
-          acl Safe_ports port 21
-          acl Safe_ports port 70
-          acl Safe_ports port 210
-          acl Safe_ports port 1025-65535
-          acl Safe_ports port 280
-          acl Safe_ports port 488
-          acl Safe_ports port 591
-          acl Safe_ports port 777
+          acl Safe_ports port 80          # http
+          acl Safe_ports port 21          # ftp
+          acl Safe_ports port 443         # https
+          acl Safe_ports port 70          # gopher
+          acl Safe_ports port 210         # wais
+          acl Safe_ports port 1025-65535  # unregistered ports
+          acl Safe_ports port 280         # http-mgmt
+          acl Safe_ports port 488         # gss-http
+          acl Safe_ports port 591         # filemaker
+          acl Safe_ports port 777         # multiling http
           acl CONNECT method CONNECT
           
-          # Access rules
+          # Default access rules
           http_access deny !Safe_ports
           http_access deny CONNECT !SSL_ports
+          http_access allow localhost
           http_access allow authenticated
           http_access deny all
           
-          # Refresh patterns
-          refresh_pattern ^ftp:		1440	20%	10080
-          refresh_pattern ^gopher:	1440	0%	1440
-          refresh_pattern -i (/cgi-bin/|\?) 0	0%	0
-          refresh_pattern .		0	20%	4320
+          # Leave via off for anonymity but handle the warning
+          via off
           EOF
 
-          # Create necessary directories
+          # Create cache directories
           sudo mkdir -p /var/cache/squid
           sudo mkdir -p /var/log/squid
           sudo chown -R proxy:proxy /var/cache/squid /var/log/squid
 
-          # Initialize cache
-          sudo squid -z
+          # Initialize cache (non-interactive)
+          sudo squid -z 2>/dev/null || true
           
           # Start Squid
-          sudo systemctl restart squid
+          sudo systemctl start squid
           sudo systemctl enable squid
           
           sleep 5
           echo "=== Squid Status ==="
-          sudo systemctl status squid --no-pager
+          sudo systemctl status squid --no-pager | head -10
           echo "=== Network Ports ==="
-          sudo netstat -tlnp | grep 3128 || echo "Checking ports..."
+          sudo netstat -tlnp | grep 3128 || echo "Squid port check"
 
       - name: Install cloudflared
         run: |
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
           sudo mv cloudflared /usr/local/bin/cloudflared
           sudo chmod +x /usr/local/bin/cloudflared
-          cloudflared --version
 
       - name: Setup tunnel configuration
         env:
@@ -94,12 +103,9 @@ jobs:
           mkdir -p ~/.cloudflared/
           echo "$TUNNEL_CREDS" > ~/.cloudflared/creds.json
           
-          TUNNEL_ID=$(jq -r '.TunnelID' ~/.cloudflared/creds.json)
-          echo "Tunnel ID: $TUNNEL_ID"
-          
-          # Create config file
+          # Create config
           cat > ~/.cloudflared/config.yml << EOF
-          tunnel: $TUNNEL_ID
+          tunnel: d09d85ca-86ef-45e3-b340-9f00d90b6244
           credentials-file: /home/runner/.cloudflared/creds.json
           ingress:
             - hostname: proxy.trendscoop.xyz
@@ -107,40 +113,39 @@ jobs:
             - service: http_status:404
           EOF
           
-          echo "=== Config Validation ==="
-          cloudflared tunnel validate 2>&1 || echo "Validation completed"
+          echo "✅ Tunnel configuration created"
 
       - name: Start Cloudflare Tunnel
         run: |
-          # Stop any existing tunnels
-          pkill cloudflared || true
+          # Stop any existing cloudflared
+          pkill cloudflared 2>/dev/null || true
           sleep 2
           
-          # Start tunnel with debug info
+          # Start tunnel
           nohup cloudflared tunnel run > tunnel.log 2>&1 &
           sleep 25
           
           echo "=== Tunnel Status ==="
-          cloudflared tunnel list 2>&1 || echo "Tunnel list command completed"
+          cloudflared tunnel list 2>&1 | head -10 || echo "Tunnel list completed"
           echo "=== Recent Logs ==="
-          tail -20 tunnel.log
+          tail -10 tunnel.log
 
       - name: Test proxy locally
         run: |
           echo "=== Testing HTTP Proxy Locally ==="
-          curl -v --proxy http://proxyuser:proxypass@127.0.0.1:3128 http://httpbin.org/ip 2>&1 | grep -E "(HTTP|ip|Connected)" || echo "HTTP test completed"
+          timeout 10 curl -s --proxy http://proxyuser:proxypass@127.0.0.1:3128 http://httpbin.org/ip || echo "HTTP test completed"
           
           echo "=== Testing HTTPS Proxy Locally ==="
-          curl -v --proxy http://proxyuser:proxypass@127.0.0.1:3128 https://httpbin.org/ip 2>&1 | grep -E "(HTTP|ip|Connected)" || echo "HTTPS test completed"
+          timeout 10 curl -s --proxy http://proxyuser:proxypass@127.0.0.1:3128 https://httpbin.org/ip || echo "HTTPS test completed"
 
       - name: Final verification
         run: |
           echo "=== Service Status ==="
           sudo systemctl is-active squid && echo "✅ Squid: RUNNING" || echo "❌ Squid: STOPPED"
-          pgrep cloudflared && echo "✅ Cloudflare Tunnel: RUNNING" || echo "❌ Cloudflare Tunnel: STOPPED"
+          pgrep cloudflared >/dev/null && echo "✅ Cloudflare Tunnel: RUNNING" || echo "❌ Cloudflare Tunnel: STOPPED"
           
           echo "=== Network Verification ==="
-          sudo netstat -tlnp | grep -E "(3128|cloudflared)" || echo "Network check completed"
+          sudo netstat -tlnp | grep 3128 && echo "✅ Squid listening on 3128" || echo "❌ Squid not listening"
 
       - name: Keep alive with usage instructions
         run: |
@@ -158,11 +163,6 @@ jobs:
           echo "Alternative syntax:"
           echo "curl -x http://proxyuser:proxypass@proxy.trendscoop.xyz:443 https://ifconfig.me"
           echo ""
-          echo "With environment variables:"
-          echo "export http_proxy=http://proxyuser:proxypass@proxy.trendscoop.xyz:443"
-          echo "export https_proxy=http://proxyuser:proxypass@proxy.trendscoop.xyz:443"
-          echo "curl https://ifconfig.me"
-          echo ""
           echo "=========================================="
           echo "🔧 CONFIGURATION:"
           echo "Proxy Server: proxy.trendscoop.xyz"
@@ -174,6 +174,10 @@ jobs:
           COUNTER=0
           while true; do
             echo "$(date) - Proxy active for $((COUNTER * 60)) seconds"
+            # Quick service check
+            sudo systemctl is-active squid >/dev/null && echo "✅ Squid OK" || echo "❌ Squid DOWN"
+            pgrep cloudflared >/dev/null && echo "✅ Tunnel OK" || echo "❌ Tunnel DOWN"
+            echo "---"
             COUNTER=$((COUNTER + 1))
             sleep 60
           done
