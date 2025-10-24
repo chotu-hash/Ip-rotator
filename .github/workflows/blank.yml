@@ -1,4 +1,4 @@
-name: HTTP Proxy via Cloudflare
+name: HTTP/HTTPS Proxy via Cloudflare
 
 on:
   workflow_dispatch:
@@ -10,66 +10,82 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt update -y
-          sudo apt install -y tinyproxy net-tools jq
+          sudo apt install -y squid jq curl
 
-      - name: Configure TinyProxy
+      - name: Configure Squid for HTTP/HTTPS
         run: |
-          # Backup original config
-          sudo cp /etc/tinyproxy/tinyproxy.conf /etc/tinyproxy/tinyproxy.conf.backup
+          # Create password file
+          echo "proxyuser:$(openssl passwd -crypt proxypass)" | sudo tee /etc/squid/passwords
+          sudo chown proxy:proxy /etc/squid/passwords
+
+          # Configure Squid
+          sudo tee /etc/squid/squid.conf > /dev/null << 'EOF'
+          http_port 3128
           
-          # Create new config
-          sudo tee /etc/tinyproxy/tinyproxy.conf > /dev/null << EOF
-          User tinyproxy
-          Group tinyproxy
-          Port 8888
-          Timeout 600
-          DefaultErrorFile "/usr/share/tinyproxy/default.html"
-          StatFile "/usr/share/tinyproxy/stats.html"
-          Logfile "/var/log/tinyproxy/tinyproxy.log"
-          LogLevel Info
-          PidFile "/var/run/tinyproxy/tinyproxy.pid"
-          MaxClients 100
-          MinSpareServers 5
-          MaxSpareServers 20
-          StartServers 10
-          MaxRequestsPerChild 0
-          Allow 127.0.0.1
-          Allow ::1
-          # Basic Authentication
-          BasicAuth proxyuser proxypass
-          # Enable connection to all domains
-          ConnectPort 443
-          ConnectPort 80
-          ConnectPort 21
-          ConnectPort 22
-          ViaProxyName "tinyproxy"
-          DisableViaHeader Yes
+          # Basic settings
+          cache deny all
+          forwarded_for delete
+          via off
+          dns_v4_first on
+          
+          # Authentication
+          auth_param basic program /usr/lib/squid/basic_ncsa_auth /etc/squid/passwords
+          auth_param basic realm "Squid Proxy"
+          auth_param basic credentialsttl 2 hours
+          auth_param basic casesensitive off
+          
+          # ACLs
+          acl authenticated proxy_auth REQUIRED
+          acl SSL_ports port 443
+          acl Safe_ports port 80
+          acl Safe_ports port 443
+          acl Safe_ports port 21
+          acl Safe_ports port 70
+          acl Safe_ports port 210
+          acl Safe_ports port 1025-65535
+          acl Safe_ports port 280
+          acl Safe_ports port 488
+          acl Safe_ports port 591
+          acl Safe_ports port 777
+          acl CONNECT method CONNECT
+          
+          # Access rules
+          http_access deny !Safe_ports
+          http_access deny CONNECT !SSL_ports
+          http_access allow authenticated
+          http_access deny all
+          
+          # Refresh patterns
+          refresh_pattern ^ftp:		1440	20%	10080
+          refresh_pattern ^gopher:	1440	0%	1440
+          refresh_pattern -i (/cgi-bin/|\?) 0	0%	0
+          refresh_pattern .		0	20%	4320
           EOF
 
-      - name: Start and test TinyProxy
-        run: |
-          # Restart tinyproxy
-          sudo systemctl restart tinyproxy
-          sudo systemctl enable tinyproxy
+          # Create necessary directories
+          sudo mkdir -p /var/cache/squid
+          sudo mkdir -p /var/log/squid
+          sudo chown -R proxy:proxy /var/cache/squid /var/log/squid
+
+          # Initialize cache
+          sudo squid -z
           
-          # Wait for service to start
+          # Start Squid
+          sudo systemctl restart squid
+          sudo systemctl enable squid
+          
           sleep 5
-          
-          echo "=== TinyProxy Status ==="
-          sudo systemctl status tinyproxy --no-pager
-          
-          echo "=== Network Status ==="
-          sudo netstat -tlnp | grep 8888 || echo "TinyProxy not listening"
-          
-          # Test locally
-          echo "=== Testing HTTP Proxy Locally ==="
-          curl -v --proxy http://proxyuser:proxypass@127.0.0.1:8888 http://ifconfig.me 2>&1 | head -20 || echo "Local test completed"
+          echo "=== Squid Status ==="
+          sudo systemctl status squid --no-pager
+          echo "=== Network Ports ==="
+          sudo netstat -tlnp | grep 3128 || echo "Checking ports..."
 
       - name: Install cloudflared
         run: |
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
           sudo mv cloudflared /usr/local/bin/cloudflared
           sudo chmod +x /usr/local/bin/cloudflared
+          cloudflared --version
 
       - name: Setup tunnel configuration
         env:
@@ -81,68 +97,83 @@ jobs:
           TUNNEL_ID=$(jq -r '.TunnelID' ~/.cloudflared/creds.json)
           echo "Tunnel ID: $TUNNEL_ID"
           
-          # Create config for HTTP proxy
+          # Create config file
           cat > ~/.cloudflared/config.yml << EOF
           tunnel: $TUNNEL_ID
           credentials-file: /home/runner/.cloudflared/creds.json
           ingress:
             - hostname: proxy.trendscoop.xyz
-              service: http://localhost:8888
-              originRequest:
-                noTLSVerify: true
+              service: http://localhost:3128
             - service: http_status:404
           EOF
           
-          echo "=== Config File ==="
-          cat ~/.cloudflared/config.yml
+          echo "=== Config Validation ==="
+          cloudflared tunnel validate 2>&1 || echo "Validation completed"
 
       - name: Start Cloudflare Tunnel
         run: |
-          # Kill any existing cloudflared processes
+          # Stop any existing tunnels
           pkill cloudflared || true
           sleep 2
           
-          # Start tunnel
+          # Start tunnel with debug info
           nohup cloudflared tunnel run > tunnel.log 2>&1 &
-          sleep 20
+          sleep 25
           
           echo "=== Tunnel Status ==="
-          cloudflared tunnel list 2>&1 || echo "Cannot list tunnels"
+          cloudflared tunnel list 2>&1 || echo "Tunnel list command completed"
+          echo "=== Recent Logs ==="
+          tail -20 tunnel.log
+
+      - name: Test proxy locally
+        run: |
+          echo "=== Testing HTTP Proxy Locally ==="
+          curl -v --proxy http://proxyuser:proxypass@127.0.0.1:3128 http://httpbin.org/ip 2>&1 | grep -E "(HTTP|ip|Connected)" || echo "HTTP test completed"
           
-          echo "=== Tunnel Log ==="
-          tail -30 tunnel.log
+          echo "=== Testing HTTPS Proxy Locally ==="
+          curl -v --proxy http://proxyuser:proxypass@127.0.0.1:3128 https://httpbin.org/ip 2>&1 | grep -E "(HTTP|ip|Connected)" || echo "HTTPS test completed"
 
-      - name: Test HTTP Proxy through Tunnel
+      - name: Final verification
         run: |
-          echo "=== Testing HTTP Proxy via Tunnel ==="
-          # This test might not work from within GitHub, but shows the command
-          echo "Use this command from your local machine:"
-          echo "curl --proxy http://proxyuser:proxypass@proxy.trendscoop.xyz:443 https://ifconfig.me"
+          echo "=== Service Status ==="
+          sudo systemctl is-active squid && echo "✅ Squid: RUNNING" || echo "❌ Squid: STOPPED"
+          pgrep cloudflared && echo "✅ Cloudflare Tunnel: RUNNING" || echo "❌ Cloudflare Tunnel: STOPPED"
+          
+          echo "=== Network Verification ==="
+          sudo netstat -tlnp | grep -E "(3128|cloudflared)" || echo "Network check completed"
+
+      - name: Keep alive with usage instructions
+        run: |
+          echo "🌐 HTTP/HTTPS PROXY READY"
+          echo "=========================================="
           echo ""
-          echo "Alternative commands:"
-          echo "curl -x http://proxyuser:proxypass@proxy.trendscoop.xyz:443 https://ifconfig.me"
+          echo "🚀 USAGE COMMANDS:"
+          echo ""
+          echo "For HTTP websites:"
           echo "curl --proxy http://proxyuser:proxypass@proxy.trendscoop.xyz:80 http://ifconfig.me"
-
-      - name: Keep alive with monitoring
-        run: |
-          echo "🌐 HTTP PROXY ACTIVE"
           echo ""
-          echo "📋 USAGE COMMANDS:"
+          echo "For HTTPS websites:"
           echo "curl --proxy http://proxyuser:proxypass@proxy.trendscoop.xyz:443 https://ifconfig.me"
-          echo "curl -x http://proxyuser:proxypass@proxy.trendscoop.xyz:443 https://ifconfig.me"
-          echo "wget -e use_proxy=yes -e http_proxy=proxy.trendscoop.xyz:443 https://ifconfig.me"
           echo ""
+          echo "Alternative syntax:"
+          echo "curl -x http://proxyuser:proxypass@proxy.trendscoop.xyz:443 https://ifconfig.me"
+          echo ""
+          echo "With environment variables:"
+          echo "export http_proxy=http://proxyuser:proxypass@proxy.trendscoop.xyz:443"
+          echo "export https_proxy=http://proxyuser:proxypass@proxy.trendscoop.xyz:443"
+          echo "curl https://ifconfig.me"
+          echo ""
+          echo "=========================================="
           echo "🔧 CONFIGURATION:"
-          echo "Proxy: proxy.trendscoop.xyz:443"
+          echo "Proxy Server: proxy.trendscoop.xyz"
+          echo "Port: 80 (HTTP) or 443 (HTTPS)"
           echo "Username: proxyuser"
           echo "Password: proxypass"
           echo ""
           echo "📊 Monitoring..."
+          COUNTER=0
           while true; do
-            echo "$(date): HTTP Proxy running - TinyProxy and Cloudflare Tunnel active"
-            # Check services
-            sudo systemctl is-active tinyproxy > /dev/null && echo "✅ TinyProxy: Active" || echo "❌ TinyProxy: Inactive"
-            pgrep cloudflared > /dev/null && echo "✅ Cloudflare Tunnel: Active" || echo "❌ Cloudflare Tunnel: Inactive"
-            echo "---"
+            echo "$(date) - Proxy active for $((COUNTER * 60)) seconds"
+            COUNTER=$((COUNTER + 1))
             sleep 60
           done
