@@ -9,9 +9,6 @@ jobs:
     timeout-minutes: 300
 
     steps:
-      # -------------------------------------------------
-      # 1. Create SSH User for VPS access
-      # -------------------------------------------------
       - name: Setup SSH User
         run: |
           PASSWORD=$(openssl rand -base64 16)
@@ -23,18 +20,34 @@ jobs:
 
           echo "✅ User 'vps' created with a random password."
 
-      # -------------------------------------------------
-      # 2. Install & connect Tailscale for remote SSH
-      # -------------------------------------------------
       - name: Install and Run Tailscale
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
           sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-ubuntu-runner
           echo "✅ Tailscale connected."
 
-      # -------------------------------------------------
-      # 3. Show SSH connection info
-      # -------------------------------------------------
+      - name: Install microsocks
+        run: |
+          sudo apt update -y
+          sudo apt install -y git build-essential curl wget
+          git clone https://github.com/rofl0r/microsocks.git
+          cd microsocks && make
+          sudo cp microsocks /usr/local/bin/
+          nohup microsocks -p 1080 -u proxyuser -P proxypass &
+
+      - name: Install Cloudflare Tunnel
+        run: |
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          sudo mv cloudflared /usr/local/bin/cloudflared
+          sudo chmod +x /usr/local/bin/cloudflared
+
+      - name: Start Cloudflare Tunnel
+        env:
+          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+        run: |
+          nohup cloudflared tunnel run --token "$CF_TUNNEL_TOKEN" > tunnel.log 2>&1 &
+          echo "✅ Tunnel started"
+          
       - name: Display Connection Details & Keep Alive
         run: |
           TS_IP=$(tailscale ip -4)
