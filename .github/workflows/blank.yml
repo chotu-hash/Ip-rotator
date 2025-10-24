@@ -1,0 +1,54 @@
+name: Linux VPS
+
+on:
+  workflow_dispatch:
+
+jobs:
+  ubuntu-vps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    steps:
+      # -------------------------------------------------
+      # 1. Create SSH User for VPS access
+      # -------------------------------------------------
+      - name: Setup SSH User
+        run: |
+          PASSWORD=$(openssl rand -base64 16)
+          echo "PASSWORD=$PASSWORD" >> $GITHUB_ENV
+
+          sudo useradd -m -s /bin/bash vps
+          echo "vps:$PASSWORD" | sudo chpasswd
+          sudo usermod -aG sudo vps
+
+          echo "✅ User 'vps' created with a random password."
+
+      # -------------------------------------------------
+      # 2. Install & connect Tailscale for remote SSH
+      # -------------------------------------------------
+      - name: Install and Run Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-ubuntu-runner
+          echo "✅ Tailscale connected."
+
+      # -------------------------------------------------
+      # 3. Show SSH connection info
+      # -------------------------------------------------
+      - name: Display Connection Details & Keep Alive
+        run: |
+          TS_IP=$(tailscale ip -4)
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+          echo "================================================="
+          echo "    SSH Connection Details"
+          echo "================================================="
+          echo "IP Address: $TS_IP"
+          echo "Username:   vps"
+          echo "Password:   ${{ env.PASSWORD }}"
+          echo ""
+          echo "To connect: ssh vps@$TS_IP"
+          echo "================================================="
+          for i in {1..60}; do
+            echo "[$(date)] Session active..."
+            sleep 300
+          done
