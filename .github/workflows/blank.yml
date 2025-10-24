@@ -12,36 +12,61 @@ jobs:
           sudo apt update -y
           sudo apt install -y git build-essential net-tools jq
 
-      - name: Build and install microsocks
+      - name: Build microsocks with debugging
         run: |
           git clone https://github.com/rofl0r/microsocks.git
           cd microsocks
           make
           sudo cp microsocks /usr/local/bin/
-          echo "✅ microsocks installed"
+          # Test if microsocks works
+          microsocks -h || echo "microsocks help test"
+          echo "✅ microsocks built and installed"
 
-      - name: Start local SOCKS5 proxy
+      - name: Start local SOCKS5 proxy with error handling
         run: |
-          # Start microsocks binding only to localhost (more secure)
-          nohup microsocks -i 127.0.0.1 -p 1080 -u proxyuser -P proxypass -v > socks.log 2>&1 &
+          # Kill any existing microsocks processes
+          pkill microsocks 2>/dev/null || true
+          sleep 2
           
+          # Start microsocks with explicit output
+          echo "Starting microsocks..."
+          microsocks -i 127.0.0.1 -p 1080 -u proxyuser -P proxypass -v &
+          MICROSOCKS_PID=$!
+          echo "microsocks PID: $MICROSOCKS_PID"
+          
+          # Wait and check if it's running
+          sleep 5
+          echo "=== Process Status ==="
+          ps -p $MICROSOCKS_PID >/dev/null && echo "✅ microsocks process running" || echo "❌ microsocks process died"
+          
+          echo "=== Network Status (as root) ==="
+          sudo netstat -tlnp | grep 1080 || echo "No port 1080 listening (may need root)"
+          
+          echo "=== Network Status (as user) ==="
+          netstat -tln | grep 1080 || echo "Port 1080 not visible to user"
+          
+          # Alternative port check
+          echo "=== Alternative Port Check ==="
+          nc -zv 127.0.0.1 1080 && echo "✅ Port 1080 is open" || echo "❌ Port 1080 is not accessible"
+
+      - name: Test SOCKS5 functionality
+        run: |
+          echo "=== Testing SOCKS5 Connection ==="
+          # Wait a bit more for microsocks to fully start
           sleep 3
-          echo "=== Local SOCKS5 Status ==="
-          netstat -tlnp | grep 1080 || echo "SOCKS5 not listening"
-          echo "=== Process Check ==="
-          ps aux | grep microsocks | grep -v grep
-
-      - name: Test local SOCKS5 proxy
-        run: |
-          echo "=== Testing Local SOCKS5 ==="
-          # Test HTTP
-          timeout 10 curl -v --socks5 127.0.0.1:1080 -U proxyuser:proxypass http://httpbin.org/ip 2>&1 | grep -E "(SOCKS5|Connected|HTTP|ip)" || echo "HTTP test completed"
           
-          # Test HTTPS
-          timeout 10 curl -v --socks5 127.0.0.1:1080 -U proxyuser:proxypass https://httpbin.org/ip 2>&1 | grep -E "(SOCKS5|Connected|HTTP|ip)" || echo "HTTPS test completed"
+          # Test with timeout and better error handling
+          timeout 10 bash -c '
+            if curl -v --socks5 127.0.0.1:1080 -U proxyuser:proxypass http://httpbin.org/ip 2>&1 | grep -q "origin"; then
+              echo "✅ SOCKS5 HTTP test PASSED"
+            else
+              echo "❌ SOCKS5 HTTP test FAILED"
+            fi
+          ' || echo "⚠️  SOCKS5 test timed out or failed"
           
-          echo "=== microsocks Log ==="
-          tail -10 socks.log || echo "No log yet"
+          # Check microsocks process again
+          echo "=== microsocks Process Check ==="
+          pgrep microsocks && echo "✅ microsocks still running" || echo "❌ microsocks not running"
 
       - name: Install cloudflared
         run: |
@@ -49,89 +74,55 @@ jobs:
           sudo mv cloudflared /usr/local/bin/cloudflared
           sudo chmod +x /usr/local/bin/cloudflared
 
-      - name: Setup Cloudflare tunnel for local SOCKS5
+      - name: Setup Cloudflare tunnel
         env:
           TUNNEL_CREDS: ${{ secrets.CF_TUNNEL_CREDENTIALS }}
         run: |
           mkdir -p ~/.cloudflared/
           echo "$TUNNEL_CREDS" > ~/.cloudflared/creds.json
           
-          # Tunnel config that points to local SOCKS5
           cat > ~/.cloudflared/config.yml << EOF
           tunnel: d09d85ca-86ef-45e3-b340-9f00d90b6244
           credentials-file: /home/runner/.cloudflared/creds.json
           ingress:
-            # TCP tunnel for SOCKS5 protocol
             - hostname: proxy.trendscoop.xyz
               service: tcp://localhost:1080
-            # Fallback
             - service: http_status:404
           EOF
-          
-          echo "✅ Tunnel configured for local SOCKS5 proxy"
 
       - name: Start Cloudflare tunnel
         run: |
-          # Stop any existing tunnels
           pkill cloudflared 2>/dev/null || true
           sleep 2
           
-          # Start tunnel (will expose local SOCKS5 to the internet)
+          echo "Starting Cloudflare tunnel..."
           nohup cloudflared tunnel run > tunnel.log 2>&1 &
-          sleep 30  # Give more time for tunnel establishment
+          sleep 30
           
           echo "=== Tunnel Status ==="
           cloudflared tunnel list 2>&1 | head -10
           echo "=== Tunnel Log ==="
           tail -20 tunnel.log
 
-      - name: Verify setup
+      - name: Final verification
         run: |
-          echo "=== Final Verification ==="
-          echo "Local Services:"
-          pgrep microsocks >/dev/null && echo "✅ microsocks (127.0.0.1:1080): RUNNING" || echo "❌ microsocks: STOPPED"
-          pgrep cloudflared >/dev/null && echo "✅ Cloudflare Tunnel: RUNNING" || echo "❌ Cloudflare Tunnel: STOPPED"
+          echo "=== Final Service Status ==="
+          echo "microsocks: $(pgrep microsocks && echo 'RUNNING' || echo 'STOPPED')"
+          echo "cloudflared: $(pgrep cloudflared && echo 'RUNNING' || echo 'STOPPED')"
           
-          echo "Network Status:"
-          netstat -tlnp | grep 1080 && echo "✅ SOCKS5 listening locally" || echo "❌ SOCKS5 not listening"
-          
-          echo "=== Architecture ==="
-          echo "microsocks ───► 127.0.0.1:1080 (local only)"
-          echo "cloudflared ──► proxy.trendscoop.xyz:443 ───► 127.0.0.1:1080"
-
-      - name: Keep alive with monitoring
-        run: |
-          echo "🌐 LOCAL SOCKS5 + CLOUDFLARE TUNNEL ACTIVE"
-          echo "=========================================="
-          echo ""
-          echo "🏗️  ARCHITECTURE:"
-          echo "microsocks bound to: 127.0.0.1:1080 (localhost only)"
-          echo "Cloudflare Tunnel exposes: proxy.trendscoop.xyz:443"
-          echo "Tunnel forwards to: localhost:1080"
-          echo ""
-          echo "🚀 USAGE:"
+          echo "=== Testing End-to-End ==="
+          echo "If both services are running, test from your local machine:"
           echo "curl --socks5-hostname proxy.trendscoop.xyz:443 -U proxyuser:proxypass https://ifconfig.me"
+
+      - name: Keep alive
+        run: |
+          echo "🌐 SERVICES MONITORING"
+          echo "microsocks (SOCKS5) → 127.0.0.1:1080"
+          echo "cloudflared (Tunnel) → proxy.trendscoop.xyz:443"
           echo ""
-          echo "🔧 SECURITY:"
-          echo "✅ SOCKS5 only accessible locally"
-          echo "✅ Cloudflare handles external access"
-          echo "✅ Authentication required"
-          echo ""
-          echo "📊 Monitoring local services..."
-          COUNTER=0
           while true; do
-            echo "$(date) - Services running for $((COUNTER * 60)) seconds"
-            if pgrep microsocks >/dev/null; then
-              echo "✅ microsocks: ACTIVE (PID: $(pgrep microsocks))"
-            else
-              echo "❌ microsocks: INACTIVE"
-            fi
-            if pgrep cloudflared >/dev/null; then
-              echo "✅ cloudflared: ACTIVE (PID: $(pgrep cloudflared))"
-            else
-              echo "❌ cloudflared: INACTIVE"
-            fi
-            echo "---"
-            COUNTER=$((COUNTER + 1))
+            MICRO_RUNNING=$(pgrep microsocks >/dev/null && echo "✅" || echo "❌")
+            CLOUDFLARE_RUNNING=$(pgrep cloudflared >/dev/null && echo "✅" || echo "❌")
+            echo "$(date) - microsocks: $MICRO_RUNNING cloudflared: $CLOUDFLARE_RUNNING"
             sleep 60
           done
