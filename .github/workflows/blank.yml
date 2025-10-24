@@ -1,4 +1,4 @@
-name: SOCKS5 Proxy via Cloudflare
+name: HTTP Proxy via Cloudflare
 
 on:
   workflow_dispatch:
@@ -10,18 +10,60 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt update -y
-          sudo apt install -y git build-essential net-tools jq
+          sudo apt install -y tinyproxy net-tools jq
 
-      - name: Install and start microsocks
+      - name: Configure TinyProxy
         run: |
-          git clone https://github.com/rofl0r/microsocks.git
-          cd microsocks && make
-          sudo cp microsocks /usr/local/bin/
-          # Start microsocks binding to localhost only (more secure)
-          nohup microsocks -i 127.0.0.1 -p 1080 -u proxyuser -P proxypass > socks.log 2>&1 &
-          sleep 3
-          echo "=== SOCKS5 Status ==="
-          netstat -tlnp | grep 1080 || echo "SOCKS5 not listening"
+          # Backup original config
+          sudo cp /etc/tinyproxy/tinyproxy.conf /etc/tinyproxy/tinyproxy.conf.backup
+          
+          # Create new config
+          sudo tee /etc/tinyproxy/tinyproxy.conf > /dev/null << EOF
+          User tinyproxy
+          Group tinyproxy
+          Port 8888
+          Timeout 600
+          DefaultErrorFile "/usr/share/tinyproxy/default.html"
+          StatFile "/usr/share/tinyproxy/stats.html"
+          Logfile "/var/log/tinyproxy/tinyproxy.log"
+          LogLevel Info
+          PidFile "/var/run/tinyproxy/tinyproxy.pid"
+          MaxClients 100
+          MinSpareServers 5
+          MaxSpareServers 20
+          StartServers 10
+          MaxRequestsPerChild 0
+          Allow 127.0.0.1
+          Allow ::1
+          # Basic Authentication
+          BasicAuth proxyuser proxypass
+          # Enable connection to all domains
+          ConnectPort 443
+          ConnectPort 80
+          ConnectPort 21
+          ConnectPort 22
+          ViaProxyName "tinyproxy"
+          DisableViaHeader Yes
+          EOF
+
+      - name: Start and test TinyProxy
+        run: |
+          # Restart tinyproxy
+          sudo systemctl restart tinyproxy
+          sudo systemctl enable tinyproxy
+          
+          # Wait for service to start
+          sleep 5
+          
+          echo "=== TinyProxy Status ==="
+          sudo systemctl status tinyproxy --no-pager
+          
+          echo "=== Network Status ==="
+          sudo netstat -tlnp | grep 8888 || echo "TinyProxy not listening"
+          
+          # Test locally
+          echo "=== Testing HTTP Proxy Locally ==="
+          curl -v --proxy http://proxyuser:proxypass@127.0.0.1:8888 http://ifconfig.me 2>&1 | head -20 || echo "Local test completed"
 
       - name: Install cloudflared
         run: |
@@ -39,13 +81,15 @@ jobs:
           TUNNEL_ID=$(jq -r '.TunnelID' ~/.cloudflared/creds.json)
           echo "Tunnel ID: $TUNNEL_ID"
           
-          # Create config file - pointing to localhost (correct)
+          # Create config for HTTP proxy
           cat > ~/.cloudflared/config.yml << EOF
           tunnel: $TUNNEL_ID
           credentials-file: /home/runner/.cloudflared/creds.json
           ingress:
             - hostname: proxy.trendscoop.xyz
-              service: tcp://localhost:1080
+              service: http://localhost:8888
+              originRequest:
+                noTLSVerify: true
             - service: http_status:404
           EOF
           
@@ -54,36 +98,51 @@ jobs:
 
       - name: Start Cloudflare Tunnel
         run: |
-          nohup cloudflared tunnel run > tunnel.log 2>&1 &
-          sleep 15
+          # Kill any existing cloudflared processes
+          pkill cloudflared || true
+          sleep 2
           
-          echo "=== Tunnel Log (last 20 lines) ==="
-          tail -20 tunnel.log || echo "No tunnel log yet"
+          # Start tunnel
+          nohup cloudflared tunnel run > tunnel.log 2>&1 &
+          sleep 20
+          
+          echo "=== Tunnel Status ==="
+          cloudflared tunnel list 2>&1 || echo "Cannot list tunnels"
+          
+          echo "=== Tunnel Log ==="
+          tail -30 tunnel.log
 
-      - name: Test SOCKS5 proxy locally
+      - name: Test HTTP Proxy through Tunnel
         run: |
-          echo "=== Testing SOCKS5 locally ==="
-          timeout 10 curl -v --socks5 127.0.0.1:1080 -U proxyuser:proxypass http://ifconfig.me 2>&1 | head -30 || echo "Local test completed"
-
-      - name: Debug information
-        run: |
-          echo "=== Network Connections ==="
-          netstat -tlnp | grep -E '(1080|cloudflared)' || echo "No relevant connections"
-          echo "=== Running Processes ==="
-          ps aux | grep -E '(microsocks|cloudflared)' | grep -v grep
-
-      - name: Keep alive
-        run: |
-          echo "🌐 SOCKS5 Proxy Setup Complete"
+          echo "=== Testing HTTP Proxy via Tunnel ==="
+          # This test might not work from within GitHub, but shows the command
+          echo "Use this command from your local machine:"
+          echo "curl --proxy http://proxyuser:proxypass@proxy.trendscoop.xyz:443 https://ifconfig.me"
           echo ""
-          echo "✅ Use this command from your local machine:"
-          echo "curl --socks5-hostname proxy.trendscoop.xyz:443 -U proxyuser:proxypass https://ifconfig.me"
+          echo "Alternative commands:"
+          echo "curl -x http://proxyuser:proxypass@proxy.trendscoop.xyz:443 https://ifconfig.me"
+          echo "curl --proxy http://proxyuser:proxypass@proxy.trendscoop.xyz:80 http://ifconfig.me"
+
+      - name: Keep alive with monitoring
+        run: |
+          echo "🌐 HTTP PROXY ACTIVE"
           echo ""
-          echo "🔍 If it doesn't work, check:"
-          echo "1. DNS is pointing to Cloudflare (proxy.trendscoop.xyz)"
-          echo "2. Tunnel is connected (check workflow logs)"
-          echo "3. Using port 443, not 1080"
+          echo "📋 USAGE COMMANDS:"
+          echo "curl --proxy http://proxyuser:proxypass@proxy.trendscoop.xyz:443 https://ifconfig.me"
+          echo "curl -x http://proxyuser:proxypass@proxy.trendscoop.xyz:443 https://ifconfig.me"
+          echo "wget -e use_proxy=yes -e http_proxy=proxy.trendscoop.xyz:443 https://ifconfig.me"
+          echo ""
+          echo "🔧 CONFIGURATION:"
+          echo "Proxy: proxy.trendscoop.xyz:443"
+          echo "Username: proxyuser"
+          echo "Password: proxypass"
+          echo ""
+          echo "📊 Monitoring..."
           while true; do
-            echo "$(date): Proxy running..." 
+            echo "$(date): HTTP Proxy running - TinyProxy and Cloudflare Tunnel active"
+            # Check services
+            sudo systemctl is-active tinyproxy > /dev/null && echo "✅ TinyProxy: Active" || echo "❌ TinyProxy: Inactive"
+            pgrep cloudflared > /dev/null && echo "✅ Cloudflare Tunnel: Active" || echo "❌ Cloudflare Tunnel: Inactive"
+            echo "---"
             sleep 60
           done
