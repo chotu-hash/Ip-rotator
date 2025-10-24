@@ -12,7 +12,7 @@ jobs:
           sudo apt update -y
           sudo apt install -y git build-essential net-tools jq curl lsof
 
-      - name: Build microsocks with debugging
+      - name: Build microsocks
         run: |
           git clone https://github.com/rofl0r/microsocks.git
           cd microsocks
@@ -28,7 +28,6 @@ jobs:
 
       - name: Start local SOCKS5 proxy
         run: |
-          # Kill any existing microsocks
           pkill microsocks 2>/dev/null || true
           sleep 2
 
@@ -39,11 +38,11 @@ jobs:
           fi
 
           echo "Starting microsocks..."
-          nohup microsocks -i 127.0.0.1 -p 1080 -u proxyuser -P proxypass -v > microsocks.log 2>&1 &
+          nohup microsocks -i 127.0.0.1 -p 1080 -u proxyuser -P proxypass > microsocks.log 2>&1 &
           MICROSOCKS_PID=$!
           echo "microsocks PID: $MICROSOCKS_PID"
 
-          # Wait a few seconds and check status
+          # Wait and check status
           sleep 5
           if ps -p $MICROSOCKS_PID >/dev/null; then
             echo "✅ microsocks process running"
