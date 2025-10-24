@@ -80,7 +80,7 @@ jobs:
         
         sudo mkdir -p "${{ env.CLOUDFLARED_DIR }}"
         sudo cp -f "${{ env.CREDS_SRC }}" "${{ env.CLOUDFLARED_DIR }}/creds.json"
-        sudo cp -f "config.yml.temp" "${{ env.CLOUDFLARED_DIR }}/config.yml"
+        sudo cp -f "config.yml.temp" "${{ env.CLOUFLARED_DIR }}/config.yml"
         
         # Set ownership to the runner user
         sudo chown -R "$(whoami)":"$(whoami)" "${{ env.CLOUDFLARED_DIR }}"
@@ -190,14 +190,11 @@ jobs:
           exit 1
         fi
         
-    - name: Tunnel is running
+    - name: Keep tunnel alive for 2 hours
       shell: bash
       run: |
         echo "The tunnel and proxy are now running in the background."
-        echo "Add subsequent steps to this job to use them."
-        # For example, to keep the job alive for 10 minutes:
-        # sleep 600
-
-
-
+        echo "This job will keep the runner alive for 2 hours..."
+        # 2 hours = 7200 seconds
+        sleep 7200
 
