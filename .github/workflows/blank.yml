@@ -131,10 +131,10 @@ jobs:
         
         echo "Starting cloudflared tunnel using config.yml"
         # Note: We use the config file from the runner's home dir
-        nohup cloudflared --config "${{ env.CLOUDFLARED_DIR }}/config.yml" tunnel run > "${{ env.TUNNEL_LOG }}" 2>&1 &
+        nohup cloudflared tunnel run > "${{ env.TUNNEL_LOG }}" 2>&1 &
         
         echo "Waiting for tunnel to establish..."
-        sleep 6
+        sleep 10
         
         if pgrep cloudflared >/dev/null 2>&1; then
           echo "cloudflared started (PID $(pgrep cloudflared))"
