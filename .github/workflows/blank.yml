@@ -1,151 +1,348 @@
-name: Dynamic SOCKS5 Proxy via Cloudflare Tunnel
+name: Cloudflared Tunnel Workflow
 
 on:
-  # Allows manual running from the GitHub Actions UI
-  workflow_dispatch:
-    inputs:
-      socks_port:
-        description: 'Local port for microsocks'
-        default: '1080'
-        required: false
+  workflow_dispatch: # Allows you to run this manually from the Actions tab
 
 jobs:
-  proxy:
-    # Runs on a fresh Ubuntu runner
+  run-tunnel:
     runs-on: ubuntu-latest
-    
-    # Define required secrets for Cloudflare credentials and config
+
     env:
-      SOCKS_PORT: ${{ github.event.inputs.socks_port || '1080' }}
-      # FIX: Using /tmp instead of unrecognized runner.temp context variable
-      MICRO_LOG: /tmp/microsocks.log
-      TUNNEL_LOG: /tmp/cloudflared_tunnel.log
-      
-    # Secrets required:
-    # CF_CREDS_JSON: Content of the Cloudflare creds.json (base64 encoded is safer, but raw JSON works too)
-    # CF_CONFIG_YML: Content of the Cloudflare config.yml
+      # -------------------------
+      # CONFIG
+      # -------------------------
+      CLOUDFLARED_DIR: "/home/runner/.cloudflared"
+      CREDS_SRC: "creds.json"        # Local temp file for creds from secret
+      SOCKS_PORT: 1080
+      MICRO_DIR: "/tmp/microsocks"
+      MICRO_BIN: "/usr/local/bin/microsocks"
+      MICRO_LOG: "/tmp/microsocks.log"
+      TUNNEL_LOG: "/tmp/cloudflared_tunnel.log"
 
     steps:
-      - name: 1. Cleanup & Setup
-        # Note: We skip most cleanup steps as GitHub Actions runs on a fresh environment.
-        run: |
-          echo "SOCKS_PORT is set to $SOCKS_PORT"
-          pkill microsocks 2>/dev/null || true
-          pkill cloudflared 2>/dev/null || true
-          
-          # 2) Setup cloudflared directory and copy files
-          mkdir -p ~/.cloudflared/
-          
-          # Write credentials (CF_CREDS_JSON) and config (CF_CONFIG_YML) from secrets
-          echo "${{ secrets.CF_CREDS_JSON }}" > ~/.cloudflared/creds.json
-          echo "${{ secrets.CF_CONFIG_YML }}" > ~/.cloudflared/config.yml
-          
-          echo "✅ Cloudflare config files written from secrets."
+    - name: 0) Sanity checks
+      shell: bash
+      run: |
+        echo "Running as user: $(whoami)"
+        if [ -z "${{ secrets.CF_CREDS_JSON }}" ]; then
+          echo "::error::CF_CREDS_JSON secret is not set."
+          exit 1
+        fi
+        if [ -z "${{ secrets.CF_CONFIG_YML }}" ]; then
+          echo "::error::CF_CONFIG_YML secret is not set."
+          exit 1
+        fi
+        echo "Sanity checks passed."
 
-      - name: 2. Install Dependencies
-        # 3) Install dependencies
-        run: |
-          echo "🌐 Installing packages..."
-          sudo apt-get update -y
-          sudo apt-get install -y git build-essential net-tools curl lsof
+    - name: 1) Cleanup previous runs
+      shell: bash
+      run: |
+        echo "Cleaning up previous runs..."
+        
+        echo "Killing old microsocks processes..."
+        pkill microsocks 2>/dev/null || true
+        
+        echo "Killing old cloudflared processes..."
+        pkill cloudflared 2>/dev/null || true
+        
+        echo "Removing old microsocks clone (${{ env.MICRO_DIR }})..."
+        sudo rm -rf "${{ env.MICRO_DIR }}"
+        
+        echo "Removing old logs..."
+        sudo rm -f "${{ env.MICRO_LOG }}" "${{ env.TUNNEL_LOG }}"
+        
+        echo "Cleanup complete."
 
-      - name: 3. Build and Install microsocks
-        # 4) Build microsocks
-        run: |
-          echo "🌐 Cloning and building microsocks..."
-          git clone https://github.com/rofl0r/microsocks.git /tmp/microsocks
-          cd /tmp/microsocks
-          make
-          
-          # Install to /usr/local/bin
-          echo "Installing microsocks to /usr/local/bin/microsocks"
-          sudo cp -f microsocks /usr/local/bin/microsocks
-          sudo chmod +x /usr/local/bin/microsocks
-          
-          # Check installation
-          microsocks -h > /dev/null && echo "✅ microsocks installed successfully." || exit 1
+    - name: 2) Setup cloudflared directory and copy files
+      shell: bash
+      run: |
+        echo "Setting up ${{ env.CLOUDFLARED_DIR }} and copying credentials/config"
+        
+        # Create temp creds file from secret
+        echo "${{ secrets.CF_CREDS_JSON }}" > "${{ env.CREDS_SRC }}"
+        # Create temp config file from secret
+        echo "${{ secrets.CF_CONFIG_YML }}" > "config.yml.temp"
+        
+        sudo mkdir -p "${{ env.CLOUDFLARED_DIR }}"
+        sudo cp -f "${{ env.CREDS_SRC }}" "${{ env.CLOUDFLARED_DIR }}/creds.json"
+        sudo cp -f "config.yml.temp" "${{ env.CLOUDFLARED_DIR }}/config.yml"
+        
+        # Set ownership to the runner user
+        sudo chown -R "$(whoami)":"$(whoami)" "${{ env.CLOUDFLARED_DIR }}"
+        
+        # Securely remove the temp files
+        rm -f "${{ env.CREDS_SRC }}"
+        rm -f "config.yml.temp"
 
-      - name: 4. Start microsocks (SOCKS5 Proxy)
-        # 5) Start microsocks
-        run: |
-          echo "🌐 Starting microsocks on 127.0.0.1:$SOCKS_PORT"
-          # FIX: Added -q (quiet) option to disable logging for stability in background mode
-          nohup /usr/local/bin/microsocks -q -i 127.0.0.1 -p "$SOCKS_PORT" > "$MICRO_LOG" 2>&1 &
-          MICRO_PID=$!
-          
-          sleep 2
-          
-          if ps -p "$MICRO_PID" >/dev/null; then
-            echo "✅ microsocks started (PID $MICRO_PID)"
-          else
-            echo "❌ microsocks failed to start. Check $MICRO_LOG"
-            tail -n 50 "$MICRO_LOG"
-            exit 1
-          fi
+    - name: 3) Install dependencies
+      shell: bash
+      run: |
+        echo "Installing packages (git, make, build-essential, net-tools, curl, lsof)"
+        sudo apt-get update -y
+        sudo apt-get install -y git build-essential net-tools curl lsof
 
-      - name: 5. Install cloudflared
-        # 6) Install cloudflared (if missing)
-        run: |
-          if ! command -v cloudflared >/dev/null 2>&1; then
-            echo "🌐 Installing cloudflared..."
-            curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cloudflared
-            sudo mv /tmp/cloudflared /usr/local/bin/cloudflared
-            sudo chmod +x /usr/local/bin/cloudflared
-          else
-            echo "✅ cloudflared already installed."
-          fi
+    - name: 4) Build microsocks
+      shell: bash
+      run: |
+        echo "Cloning and building microsocks"
+        git clone https://github.com/rofl0r/microsocks.git "${{ env.MICRO_DIR }}"
+        cd "${{ env.MICRO_DIR }}"
+        make
+        echo "Installing microsocks to ${{ env.MICRO_BIN }}"
+        sudo cp -f microsocks "${{ env.MICRO_BIN }}"
+        sudo chmod +x "${{ env.MICRO_BIN }}"
+        cd "$GITHUB_WORKSPACE"
 
-      - name: 6. Start Cloudflare Tunnel
-        # 7) Start cloudflared tunnel
-        run: |
-          echo "🌐 Starting cloudflared tunnel using config.yml..."
-          # Start in the background
-          nohup cloudflared tunnel run --config ~/.cloudflared/config.yml > "$TUNNEL_LOG" 2>&1 &
-          
-          CLOUDFLARED_PID=$!
-          sleep 10 # Wait longer for tunnel establishment
-          
-          if ps -p "$CLOUDFLARED_PID" >/dev/null; then
-            echo "✅ cloudflared started (PID $CLOUDFLARED_PID)"
-          else
-            echo "❌ cloudflared failed to start. Check $TUNNEL_LOG"
-            tail -n 50 "$TUNNEL_LOG"
-            exit 1
-          fi
+    - name: 5) Start microsocks
+      shell: bash
+      run: |
+        echo "Preparing log ${{ env.MICRO_LOG }}"
+        sudo mkdir -p "$(dirname "${{ env.MICRO_LOG }}")"
+        sudo touch "${{ env.MICRO_LOG }}"
+        sudo chown "$(whoami)":"$(whoami)" "${{ env.MICRO_LOG }}"
+        
+        echo "Starting microsocks on 127.0.0.1:${{ env.SOCKS_PORT }}"
+        nohup "${{ env.MICRO_BIN }}" -i 127.0.0.1 -p "${{ env.SOCKS_PORT }}" > "${{ env.MICRO_LOG }}" 2>&1 &
+        sleep 2
+        
+        if pgrep microsocks >/dev/null 2>&1; then
+          echo "microsocks started (PID $(pgrep microsocks))"
+        else
+          echo "::error::microsocks failed to start; last 50 lines of log:"
+          tail -n 50 "${{ env.MICRO_LOG }}"
+          exit 1
+        fi
 
-      - name: 7. Test Local SOCKS5 Connectivity
-        # 8) Quick test microsocks
-        run: |
-          echo "🌐 Testing local SOCKS5 proxy..."
-          IP=$(curl -s --max-time 10 --socks5-hostname 127.0.0.1:"$SOCKS_PORT" https://api.ipify.org || echo "FAIL")
+    - name: 6) Install cloudflared
+      shell: bash
+      run: |
+        echo "Installing cloudflared"
+        curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cloudflared
+        sudo mv /tmp/cloudflared /usr/local/bin/cloudflared
+        sudo chmod +x /usr/local/bin/cloudflared
+        cloudflared --version
 
-          if [[ $IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "✅ Proxy test OK — external IP via proxy: $IP"
-          else
-            echo "❌ Proxy test failed. IP returned: $IP"
-            exit 1
-          fi
-          
-      - name: 8. Keep Alive and Monitor Services
-        # 8) Keep alive and monitor (The final, crucial step to keep the job running)
-        run: |
-          echo "=========================================================="
-          echo "🌐 Services are running. This job will continue until timeout."
-          echo "Check your Cloudflare Access policy for the hostname (it must be 'Bypass')."
-          echo "=========================================================="
-          
-          # The infinite loop that keeps the job alive while the background processes run
-          while true; do
-            MICRO_COUNT=$(pgrep microsocks | wc -l)
-            CLOUDFLARE_COUNT=$(pgrep cloudflared | wc -l)
-            
-            if [ "$MICRO_COUNT" -eq 0 ] || [ "$CLOUDFLARE_COUNT" -eq 0 ]; then
-              echo "🚨 $(date) - A critical service has stopped. Exiting job."
-              pgrep microsocks || tail -n 20 "$MICRO_LOG"
-              pgrep cloudflared || tail -n 20 "$TUNNEL_LOG"
-              exit 1
-            fi
-            
-            echo "$(date '+%Y-%m-%d %H:%M:%S') - microsocks: Running ($MICRO_COUNT) | cloudflared: Running ($CLOUDFLARE_COUNT)"
-            sleep 60
-          done
+    - name: 7) Start cloudflared tunnel
+      shell: bash
+      run: |
+        echo "Preparing tunnel log ${{ env.TUNNEL_LOG }}"
+        sudo touch "${{ env.TUNNEL_LOG }}"
+        sudo chown "$(whoami)":"$(whoami)" "${{ env.TUNNEL_LOG }}"
+        
+        echo "Starting cloudflared tunnel using config.yml"
+        # Note: We use the config file from the runner's home dir
+        nohup cloudflared --config "${{ env.CLOUDFLARED_DIR }}/config.yml" tunnel run > "${{ env.TUNNEL_LOG }}" 2>&1 &
+        
+        echo "Waiting for tunnel to establish..."
+        sleep 6
+        
+        if pgrep cloudflared >/dev/null 2>&1; then
+          echo "cloudflared started (PID $(pgrep cloudflared))"
+        else
+          echo "::error::cloudflared failed to start; last 50 lines of log:"
+          tail -n 50 "${{ env.TUNNEL_LOG }}"
+          exit 1
+        fi
+
+    - name: 8) Quick test microsocks
+      shell: bash
+      run: |
+        echo "Testing local SOCKS5 proxy"
+        IP_JSON=$(curl -s --max-time 10 --socks5-hostname 127.0.0.1:"${{ env.SOCKS_PORT }}" https://www.cloudflare.com/cdn-cgi/trace/)
+        
+        if [ $? -eq 0 ]; then
+          echo "Raw trace output:"
+          echo "$IP_JSON"
+          IP=$(echo "$IP_JSON" | grep 'ip=' | cut -d= -f2)
+          echo "✅ Proxy test OK — external IP via proxy: $IP"
+        else
+          echo "::error::Proxy test failed — check logs"
+          echo "--- microsocks log ---"
+          cat "${{ env.MICRO_LOG }}"
+          echo "--- cloudflared log ---"
+          cat "${{ env.TUNNEL_LOG }}"
+          exit 1
+        fi
+        
+    - name: Tunnel is running
+      shell: bash
+      run: |
+        echo "The tunnel and proxy are now running in the background."
+        echo "Add subsequent steps to this job to use them."
+        # For example, to keep the job alive for 10 minutes:
+        # sleep 600
+
+name: Cloudflared Tunnel Workflow
+
+on:
+  workflow_dispatch: # Allows you to run this manually from the Actions tab
+
+jobs:
+  run-tunnel:
+    runs-on: ubuntu-latest
+
+    env:
+      # -------------------------
+      # CONFIG
+      # -------------------------
+      CLOUDFLARED_DIR: "/home/runner/.cloudflared"
+      CREDS_SRC: "creds.json"        # Local temp file for creds from secret
+      SOCKS_PORT: 1080
+      MICRO_DIR: "/tmp/microsocks"
+      MICRO_BIN: "/usr/local/bin/microsocks"
+      MICRO_LOG: "/tmp/microsocks.log"
+      TUNNEL_LOG: "/tmp/cloudflared_tunnel.log"
+
+    steps:
+    - name: 0) Sanity checks
+      shell: bash
+      run: |
+        echo "Running as user: $(whoami)"
+        if [ -z "${{ secrets.CF_CREDS_JSON }}" ]; then
+          echo "::error::CF_CREDS_JSON secret is not set."
+          exit 1
+        fi
+        if [ -z "${{ secrets.CF_CONFIG_YML }}" ]; then
+          echo "::error::CF_CONFIG_YML secret is not set."
+          exit 1
+        fi
+        echo "Sanity checks passed."
+
+    - name: 1) Cleanup previous runs
+      shell: bash
+      run: |
+        echo "Cleaning up previous runs..."
+        
+        echo "Killing old microsocks processes..."
+        pkill microsocks 2>/dev/null || true
+        
+        echo "Killing old cloudflared processes..."
+        pkill cloudflared 2>/dev/null || true
+        
+        echo "Removing old microsocks clone (${{ env.MICRO_DIR }})..."
+        sudo rm -rf "${{ env.MICRO_DIR }}"
+        
+        echo "Removing old logs..."
+        sudo rm -f "${{ env.MICRO_LOG }}" "${{ env.TUNNEL_LOG }}"
+        
+        echo "Cleanup complete."
+
+    - name: 2) Setup cloudflared directory and copy files
+      shell: bash
+      run: |
+        echo "Setting up ${{ env.CLOUDFLARED_DIR }} and copying credentials/config"
+        
+        # Create temp creds file from secret
+        echo "${{ secrets.CF_CREDS_JSON }}" > "${{ env.CREDS_SRC }}"
+        # Create temp config file from secret
+        echo "${{ secrets.CF_CONFIG_YML }}" > "config.yml.temp"
+        
+        sudo mkdir -p "${{ env.CLOUDFLARED_DIR }}"
+        sudo cp -f "${{ env.CREDS_SRC }}" "${{ env.CLOUDFLARED_DIR }}/creds.json"
+        sudo cp -f "config.yml.temp" "${{ env.CLOUDFLARED_DIR }}/config.yml"
+        
+        # Set ownership to the runner user
+        sudo chown -R "$(whoami)":"$(whoami)" "${{ env.CLOUDFLARED_DIR }}"
+        
+        # Securely remove the temp files
+        rm -f "${{ env.CREDS_SRC }}"
+        rm -f "config.yml.temp"
+
+    - name: 3) Install dependencies
+      shell: bash
+      run: |
+        echo "Installing packages (git, make, build-essential, net-tools, curl, lsof)"
+        sudo apt-get update -y
+        sudo apt-get install -y git build-essential net-tools curl lsof
+
+    - name: 4) Build microsocks
+      shell: bash
+      run: |
+        echo "Cloning and building microsocks"
+        git clone https://github.com/rofl0r/microsocks.git "${{ env.MICRO_DIR }}"
+        cd "${{ env.MICRO_DIR }}"
+        make
+        echo "Installing microsocks to ${{ env.MICRO_BIN }}"
+        sudo cp -f microsocks "${{ env.MICRO_BIN }}"
+        sudo chmod +x "${{ env.MICRO_BIN }}"
+        cd "$GITHUB_WORKSPACE"
+
+    - name: 5) Start microsocks
+      shell: bash
+      run: |
+        echo "Preparing log ${{ env.MICRO_LOG }}"
+        sudo mkdir -p "$(dirname "${{ env.MICRO_LOG }}")"
+        sudo touch "${{ env.MICRO_LOG }}"
+        sudo chown "$(whoami)":"$(whoami)" "${{ env.MICRO_LOG }}"
+        
+        echo "Starting microsocks on 127.0.0.1:${{ env.SOCKS_PORT }}"
+        nohup "${{ env.MICRO_BIN }}" -i 127.0.0.1 -p "${{ env.SOCKS_PORT }}" > "${{ env.MICRO_LOG }}" 2>&1 &
+        sleep 2
+        
+        if pgrep microsocks >/dev/null 2>&1; then
+          echo "microsocks started (PID $(pgrep microsocks))"
+        else
+          echo "::error::microsocks failed to start; last 50 lines of log:"
+          tail -n 50 "${{ env.MICRO_LOG }}"
+          exit 1
+        fi
+
+    - name: 6) Install cloudflared
+      shell: bash
+      run: |
+        echo "Installing cloudflared"
+        curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cloudflared
+        sudo mv /tmp/cloudflared /usr/local/bin/cloudflared
+        sudo chmod +x /usr/local/bin/cloudflared
+        cloudflared --version
+
+    - name: 7) Start cloudflared tunnel
+      shell: bash
+      run: |
+        echo "Preparing tunnel log ${{ env.TUNNEL_LOG }}"
+        sudo touch "${{ env.TUNNEL_LOG }}"
+        sudo chown "$(whoami)":"$(whoami)" "${{ env.TUNNEL_LOG }}"
+        
+        echo "Starting cloudflared tunnel using config.yml"
+        # Note: We use the config file from the runner's home dir
+        nohup cloudflared --config "${{ env.CLOUDFLARED_DIR }}/config.yml" tunnel run > "${{ env.TUNNEL_LOG }}" 2>&1 &
+        
+        echo "Waiting for tunnel to establish..."
+        sleep 6
+        
+        if pgrep cloudflared >/dev/null 2>&1; then
+          echo "cloudflared started (PID $(pgrep cloudflared))"
+        else
+          echo "::error::cloudflared failed to start; last 50 lines of log:"
+          tail -n 50 "${{ env.TUNNEL_LOG }}"
+          exit 1
+        fi
+
+    - name: 8) Quick test microsocks
+      shell: bash
+      run: |
+        echo "Testing local SOCKS5 proxy"
+        IP_JSON=$(curl -s --max-time 10 --socks5-hostname 127.0.0.1:"${{ env.SOCKS_PORT }}" https://www.cloudflare.com/cdn-cgi/trace/)
+        
+        if [ $? -eq 0 ]; then
+          echo "Raw trace output:"
+          echo "$IP_JSON"
+          IP=$(echo "$IP_JSON" | grep 'ip=' | cut -d= -f2)
+          echo "✅ Proxy test OK — external IP via proxy: $IP"
+        else
+          echo "::error::Proxy test failed — check logs"
+          echo "--- microsocks log ---"
+          cat "${{ env.MICRO_LOG }}"
+          echo "--- cloudflared log ---"
+          cat "${{ env.TUNNEL_LOG }}"
+          exit 1
+        fi
+        
+    - name: Tunnel is running
+      shell: bash
+      run: |
+        echo "The tunnel and proxy are now running in the background."
+        echo "Add subsequent steps to this job to use them."
+        # For example, to keep the job alive for 10 minutes:
+        # sleep 600
+
