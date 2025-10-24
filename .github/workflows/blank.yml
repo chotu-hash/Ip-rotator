@@ -2,6 +2,9 @@ name: Cloudflared Tunnel Workflow
 
 on:
   workflow_dispatch: # Allows you to run this manually from the Actions tab
+  schedule:
+    # Run the workflow every 30 minutes
+    - cron: '*/20 * * * *'
 
 jobs:
   run-tunnel:
@@ -197,12 +200,16 @@ jobs:
           exit 1
         fi
         
-    - name: Keep tunnel alive for 2 hours
+    - name: Keep tunnel alive for a random duration
       shell: bash
       run: |
+        # Random duration between 15 mins (900s) and 30 mins (1800s)
+        MIN_DURATION=900
+        MAX_DURATION=1800
+        RANGE=$((MAX_DURATION - MIN_DURATION + 1))
+        DURATION=$((RANDOM % RANGE + MIN_DURATION))
+        
         echo "The tunnel and proxy are now running in the background."
-        echo "This job will keep the runner alive for 2 hours..."
-        # 2 hours = 7200 seconds
-        sleep 7200
-
+        echo "This job will keep the runner alive for $DURATION seconds (between 15 and 30 minutes)..."
+        sleep $DURATION
 
