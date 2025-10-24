@@ -17,8 +17,9 @@ jobs:
     # Define required secrets for Cloudflare credentials and config
     env:
       SOCKS_PORT: ${{ github.event.inputs.socks_port || '1080' }}
-      MICRO_LOG: ${{ runner.temp }}/microsocks.log
-      TUNNEL_LOG: ${{ runner.temp }}/cloudflared_tunnel.log
+      # FIX: Using /tmp instead of unrecognized runner.temp context variable
+      MICRO_LOG: /tmp/microsocks.log
+      TUNNEL_LOG: /tmp/cloudflared_tunnel.log
       
     # Secrets required:
     # CF_CREDS_JSON: Content of the Cloudflare creds.json (base64 encoded is safer, but raw JSON works too)
