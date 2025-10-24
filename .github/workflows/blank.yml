@@ -2,6 +2,7 @@ name: Local SOCKS5 + Cloudflare Tunnel
 
 on:
   workflow_dispatch:
+    # Optional: You can add inputs here if you want to dynamically set proxy user/pass/tunnel ID
 
 jobs:
   proxy:
@@ -17,26 +18,24 @@ jobs:
           git clone https://github.com/rofl0r/microsocks.git
           cd microsocks
           make
-          sudo cp microsocks /usr/local/bin/
+          # Use -s to strip unnecessary symbols for a smaller binary
+          sudo install -s microsocks /usr/local/bin/
           microsocks -h || echo "microsocks help test"
           echo "✅ microsocks built and installed"
 
       - name: Ensure SOCKS5 user exists
         run: |
+          # Use usermod -p to directly set the crypted password if needed, but microsocks uses its own auth list, so this is just for consistency
           sudo useradd -M -s /usr/sbin/nologin proxyuser || true
           echo "✅ User 'proxyuser' ready for SOCKS5"
 
       - name: Start local SOCKS5 proxy
         run: |
+          # Ensure any previous instance is killed
           pkill microsocks 2>/dev/null || true
           sleep 2
 
-          # Ensure port 1080 is free
-          if sudo lsof -i :1080; then
-            echo "❌ Port 1080 is in use, cannot start microsocks"
-            exit 1
-          fi
-
+          # Start microsocks on 127.0.0.1:1080 with specified user/pass
           echo "Starting microsocks..."
           nohup microsocks -i 127.0.0.1 -p 1080 -u proxyuser -P proxypass > microsocks.log 2>&1 &
           MICROSOCKS_PID=$!
@@ -45,46 +44,38 @@ jobs:
           # Wait and check status
           sleep 5
           if ps -p $MICROSOCKS_PID >/dev/null; then
-            echo "✅ microsocks process running"
+            echo "✅ microsocks process running on 127.0.0.1:1080"
           else
-            echo "❌ microsocks failed to start, see microsocks.log"
+            echo "❌ microsocks failed to start. Check microsocks.log"
             tail -20 microsocks.log
             exit 1
           fi
+        # Store PID for clean termination (optional but good practice)
+        id: start_socks
+        env:
+          MICROSOCKS_PID: ${{ steps.start_socks.outputs.MICROSOCKS_PID }}
 
-      - name: Test SOCKS5 functionality
+      - name: Test SOCKS5 functionality (Internal Test)
         run: |
-          echo "=== Testing SOCKS5 Connection ==="
+          echo "=== Testing Internal SOCKS5 Connection ==="
           sleep 3
-          
+          # Test connecting to an external service *through* the SOCKS proxy
           timeout 15 bash -c '
-            # Use HTTPS and --socks5-hostname for proper hostname resolution
             RESPONSE=$(curl -s --socks5-hostname 127.0.0.1:1080 -U proxyuser:proxypass https://api.ipify.org)
             if [[ $RESPONSE =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-              echo "✅ SOCKS5 HTTPS test PASSED (IP: $RESPONSE)"
+              echo "✅ SOCKS5 Internal test PASSED (IP: $RESPONSE)"
             else
-              echo "❌ SOCKS5 HTTPS test FAILED"
+              echo "❌ SOCKS5 Internal test FAILED. Response: $RESPONSE"
               echo "=== Last 20 lines of microsocks.log ==="
               tail -20 microsocks.log
               exit 1
             fi
           '
-          
-          echo "=== microsocks Process Check ==="
-          if pgrep microsocks >/dev/null; then
-            echo "✅ microsocks still running"
-          else
-            echo "❌ microsocks not running"
-            tail -20 microsocks.log
-            exit 1
-          fi
-
 
       - name: Install cloudflared
         run: |
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
-          sudo mv cloudflared /usr/local/bin/cloudflared
-          sudo chmod +x /usr/local/bin/cloudflared
+          sudo install -s cloudflared /usr/local/bin/cloudflared
           echo "✅ cloudflared installed"
 
       - name: Setup Cloudflare tunnel
@@ -92,11 +83,14 @@ jobs:
           TUNNEL_CREDS: ${{ secrets.CF_TUNNEL_CREDENTIALS }}
         run: |
           mkdir -p ~/.cloudflared/
-          echo "$TUNNEL_CREDS" > ~/.cloudflared/creds.json
+          # Ensure the credentials file is correctly formatted (JSON)
+          echo "$TUNNEL_CREDS" | base64 -d > ~/.cloudflared/creds.json
 
           cat > ~/.cloudflared/config.yml << EOF
           tunnel: d09d85ca-86ef-45e3-b340-9f00d90b6244
           credentials-file: /home/runner/.cloudflared/creds.json
+          # Note: The Cloudflare configuration for this hostname must NOT use Cloudflare Access
+          # as it breaks raw TCP protocols like SOCKS5.
           ingress:
             - hostname: proxy.trendscoop.xyz
               service: tcp://localhost:1080
@@ -109,29 +103,48 @@ jobs:
           pkill cloudflared 2>/dev/null || true
           sleep 2
           echo "Starting Cloudflare tunnel..."
+          # Start cloudflared in the background
           nohup cloudflared tunnel run > tunnel.log 2>&1 &
           CLOUDFLARE_PID=$!
+          # Wait longer for tunnel establishment
           sleep 30
           ps -p $CLOUDFLARE_PID >/dev/null && echo "✅ cloudflared running" || echo "❌ cloudflared failed, see tunnel.log"
           tail -20 tunnel.log
+          echo "::set-output name=CLOUDFLARE_PID::$CLOUDFLARE_PID"
+        id: start_tunnel
 
-      - name: Final verification
+      - name: Final Verification & Keep alive
         run: |
-          echo "=== Final Service Status ==="
-          echo "microsocks: $(pgrep microsocks >/dev/null && echo 'RUNNING' || echo 'STOPPED')"
-          echo "cloudflared: $(pgrep cloudflared >/dev/null && echo 'RUNNING' || echo 'STOPPED')"
+          echo "=========================================="
+          echo "=== ⚠️ Cloudflare Access Must Be Disabled ==="
+          echo "=========================================="
+          echo "If the external curl fails, check that the application rule for"
+          echo "'proxy.trendscoop.xyz' in Cloudflare Access is set to 'Bypass'."
           echo ""
+          echo "SOCKS5 Proxy exposed via Cloudflare Tunnel:"
+          echo "  - Endpoint: https://proxy.trendscoop.xyz:443"
+          echo "  - Credentials: proxyuser:proxypass"
+          echo "=========================================="
           echo "Test from your local machine:"
-          echo "curl --socks5-hostname proxy.trendscoop.xyz:443 -U proxyuser:proxypass https://ifconfig.me"
+          echo "curl -s --socks5-hostname proxy.trendscoop.xyz:443 -U proxyuser:proxypass https://ifconfig.me"
+          echo "=========================================="
 
-      - name: Keep alive and monitor services
-        run: |
-          echo "🌐 SERVICES MONITORING"
-          echo "microsocks (SOCKS5) → 127.0.0.1:1080"
-          echo "cloudflared (Tunnel) → proxy.trendscoop.xyz:443"
+          echo "🌐 SERVICES MONITORING (Running until job timeout)"
           while true; do
             MICRO_RUNNING=$(pgrep microsocks >/dev/null && echo "✅" || echo "❌")
             CLOUDFLARE_RUNNING=$(pgrep cloudflared >/dev/null && echo "✅" || echo "❌")
-            echo "$(date) - microsocks: $MICRO_RUNNING cloudflared: $CLOUDFLARE_RUNNING"
+            
+            # Check for sudden death
+            if [ "$MICRO_RUNNING" = "❌" ]; then
+              echo "🚨 $(date) - microsocks has STOPPED. Exiting job."
+              exit 1
+            fi
+            if [ "$CLOUDFLARE_RUNNING" = "❌" ]; then
+              echo "🚨 $(date) - cloudflared has STOPPED. Exiting job."
+              tail -20 tunnel.log
+              exit 1
+            fi
+            
+            echo "$(date) - microsocks: $MICRO_RUNNING | cloudflared: $CLOUDFLARE_RUNNING"
             sleep 60
           done
