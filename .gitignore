@@ -1,0 +1,13 @@
+# Service files
+*.log
+*.tmp
+/config/creds.json
+/service-config.yml
+
+# System
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
