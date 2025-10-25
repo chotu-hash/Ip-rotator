@@ -1,0 +1,10 @@
+# Cloudflare Service Configuration
+# Replace with your actual configuration
+
+tunnel: your-tunnel-id
+credentials-file: /home/runner/.cloudflared/creds.json
+
+ingress:
+  - hostname: your-domain.example.com
+    service: http://localhost:8080
+  - service: http_status:404
