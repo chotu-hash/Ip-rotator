@@ -2,9 +2,6 @@ name: Cloudflared Tunnel Workflow
 
 on:
   workflow_dispatch: # Allows you to run this manually from the Actions tab
-  schedule:
-    # Run the workflow every 30 minutes
-    - cron: '*/20 * * * *'
 
 jobs:
   run-tunnel:
@@ -70,18 +67,7 @@ jobs:
         SECRET_CONFIG: ${{ secrets.CF_CONFIG_YML }}
       run: |
         echo "Setting up ${{ env.CLOUDFLARED_DIR }} and copying credentials/config"
-        
-        # --- DEBUG: PRINTING SECRETS ---
-        # WARNING: This exposes secrets in your logs. Remove after debugging.
-        echo "--- DEBUG: CF_CREDS_JSON ---"
-        echo "$SECRET_CREDS"
-        echo "----------------------------"
-        
-        echo "--- DEBUG: CF_CONFIG_YML ---"
-        echo "$SECRET_CONFIG"
-        echo "----------------------------"
-        # --- END DEBUG ---
-
+      
         # Create temp creds file from secret
         # Using printf is safer than echo for multi-line strings
         printf "%s\n" "$SECRET_CREDS" > "${{ env.CREDS_SRC }}"
