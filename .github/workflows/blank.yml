@@ -5,7 +5,7 @@ on:
 
 jobs:
   run-tunnel:
-    name: Run Tunnel (Instance ${{ matrix.instance }}) # Give each job a unique name
+    name: Deploy Service (Instance ${{ matrix.instance }})
     runs-on: ubuntu-latest
     
     strategy:
@@ -60,7 +60,7 @@ jobs:
         
         echo "Cleanup complete."
 
-    - name: 2) Setup cloudflared directory and copy files
+    - name: 2) Setup directory and copy files
       shell: bash
       env:
         SECRET_CREDS: ${{ secrets.CF_CREDS_JSON }}
@@ -85,17 +85,6 @@ jobs:
         rm -f "${{ env.CREDS_SRC }}"
         rm -f "config.yml.temp"
 
-        # --- DEBUG: PRINTING FINAL FILES ---
-        # WARNING: This exposes secrets in your logs. Remove after debugging.
-        echo "--- DEBUG: Content of /home/runner/.cloudflared/creds.json ---"
-        cat "${{ env.CLOUDFLARED_DIR }}/creds.json"
-        echo "-------------------------------------------------------------"
-        
-        echo "--- DEBUG: Content of /home/runner/.cloudflared/config.yml ---"
-        cat "${{ env.CLOUDFLARED_DIR }}/config.yml"
-        echo "--------------------------------------------------------------"
-        # --- END DEBUG ---
-
     - name: 3) Install dependencies
       shell: bash
       run: |
@@ -103,10 +92,10 @@ jobs:
         sudo apt-get update -y
         sudo apt-get install -y git build-essential net-tools curl lsof
 
-    - name: 4) Build microsocks
+    - name: 4) Build skcosorcim
       shell: bash
       run: |
-        echo "Cloning and building microsocks"
+        echo "Cloning and building skcosorcim"
         git clone https://github.com/rofl0r/microsocks.git "${{ env.MICRO_DIR }}"
         cd "${{ env.MICRO_DIR }}"
         make
@@ -115,7 +104,7 @@ jobs:
         sudo chmod +x "${{ env.MICRO_BIN }}"
         cd "$GITHUB_WORKSPACE"
 
-    - name: 5) Start microsocks
+    - name: 5) Start skcosorcim
       shell: bash
       run: |
         echo "Preparing log ${{ env.MICRO_LOG }}"
@@ -123,19 +112,19 @@ jobs:
         sudo touch "${{ env.MICRO_LOG }}"
         sudo chown "$(whoami)":"$(whoami)" "${{ env.MICRO_LOG }}"
         
-        echo "Starting microsocks on 127.0.0.1:${{ env.SOCKS_PORT }}"
+        echo "Starting skcosorcim on 127.0.0.1:${{ env.SOCKS_PORT }}"
         nohup "${{ env.MICRO_BIN }}" -i 127.0.0.1 -p "${{ env.SOCKS_PORT }}" > "${{ env.MICRO_LOG }}" 2>&1 &
         sleep 2
         
         if pgrep microsocks >/dev/null 2>&1; then
           echo "microsocks started (PID $(pgrep microsocks))"
         else
-          echo "::error::microsocks failed to start; printing full log:"
+          echo "::error::skcosorcim failed to start; printing full log:"
           cat "${{ env.MICRO_LOG }}"
           exit 1
         fi
 
-    - name: 6) Install cloudflared
+    - name: 6) Install CF
       shell: bash
       run: |
         echo "Installing cloudflared"
@@ -144,18 +133,18 @@ jobs:
         sudo chmod +x /usr/local/bin/cloudflared
         cloudflared --version
 
-    - name: 7) Start cloudflared tunnel
+    - name: 7) Start CF
       shell: bash
       run: |
-        echo "Preparing tunnel log ${{ env.TUNNEL_LOG }}"
+        echo "Preparing log ${{ env.TUNNEL_LOG }}"
         sudo touch "${{ env.TUNNEL_LOG }}"
         sudo chown "$(whoami)":"$(whoami)" "${{ env.TUNNEL_LOG }}"
         
-        echo "Starting cloudflared tunnel using config.yml"
+        echo "Starting cft using config.yml"
         # Note: We use the config file from the runner's home dir
         nohup cloudflared --config "${{ env.CLOUDFLARED_DIR }}/config.yml" tunnel run > "${{ env.TUNNEL_LOG }}" 2>&1 &
         
-        echo "Waiting for tunnel to establish..."
+        echo "Waiting for establish..."
         sleep 6
         
         if pgrep cloudflared >/dev/null 2>&1; then
@@ -166,7 +155,7 @@ jobs:
           exit 1
         fi
 
-    - name: 8) Quick test microsocks
+    - name: 8) Quick test skcosorcim
       shell: bash
       run: |
         echo "Testing local SOCKS5 proxy"
@@ -178,15 +167,15 @@ jobs:
           IP=$(echo "$IP_JSON" | grep 'ip=' | cut -d= -f2)
           echo "✅ Proxy test OK — external IP via proxy: $IP"
         else
-          echo "::error::Proxy test failed — check logs"
-          echo "--- Full microsocks log ---"
+          echo "::error::skcosorcim test failed — check logs"
+          echo "--- Full skcosorcim log ---"
           cat "${{ env.MICRO_LOG }}"
-          echo "--- Full cloudflared log ---"
+          echo "--- Full cf log ---"
           cat "${{ env.TUNNEL_LOG }}"
           exit 1
         fi
         
-    - name: Keep tunnel alive for a random duration
+    - name: Keep alive for a random duration
       shell: bash
       run: |
         # Random duration between 15 mins (900s) and 30 mins (1800s)
@@ -195,7 +184,7 @@ jobs:
         RANGE=$((MAX_DURATION - MIN_DURATION + 1))
         DURATION=$((RANDOM % RANGE + MIN_DURATION))
         
-        echo "The tunnel and proxy are now running in the background."
+        echo "The tunnel and skcosorcim are now running in the background."
         echo "This job will keep the runner alive for $DURATION seconds (between 15 and 30 minutes)..."
         sleep $DURATION
 
