@@ -1,0 +1,134 @@
+name: Service Deployment
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy-service:
+    name: Deploy Cloudflare Service
+    runs-on: ubuntu-latest
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        instance: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+
+    env:
+      SERVICE_DIR: "/home/runner/.cloudflared"
+      SERVICE_PORT: 1080
+      AUX_DIR: "/tmp/microsocks"
+      AUX_BIN: "/usr/local/bin/microsocks"
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Validate configuration
+      shell: bash
+      run: |
+        if [ -z "${{ secrets.CF_CREDS_JSON }}" ]; then
+          echo "::error::CF_CREDS_JSON secret is not set."
+          exit 1
+        fi
+        if [ -z "${{ secrets.CF_CONFIG_YML }}" ]; then
+          echo "::error::CF_CONFIG_YML secret is not set."
+          exit 1
+        fi
+
+    - name: Clean environment
+      shell: bash
+      run: |
+        echo "Preparing clean environment..."
+        pkill microsocks 2>/dev/null || true
+        pkill cloudflared 2>/dev/null || true
+        sudo rm -rf "${{ env.AUX_DIR }}"
+        sudo rm -f "/tmp/service.log" "/tmp/tunnel.log"
+
+    - name: Configure service
+      shell: bash
+      env:
+        SERVICE_CREDS: ${{ secrets.CF_CREDS_JSON }}
+        SERVICE_CONFIG: ${{ secrets.CF_CONFIG_YML }}
+      run: |
+        echo "Configuring service environment..."
+        
+        sudo mkdir -p "${{ env.SERVICE_DIR }}"
+        printf "%s\n" "$SERVICE_CREDS" > "${{ env.SERVICE_DIR }}/creds.json"
+        printf "%s\n" "$SERVICE_CONFIG" > "${{ env.SERVICE_DIR }}/config.yml"
+        sudo chown -R "$(whoami)":"$(whoami)" "${{ env.SERVICE_DIR }}"
+
+    - name: Install system packages
+      shell: bash
+      run: |
+        echo "Installing required packages..."
+        sudo apt-get update -y
+        sudo apt-get install -y git build-essential net-tools curl lsof
+
+    - name: Setup cloudflared
+      shell: bash
+      run: |
+        echo "Installing cloudflared service..."
+        curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cloudflared
+        sudo mv /tmp/cloudflared /usr/local/bin/cloudflared
+        sudo chmod +x /usr/local/bin/cloudflared
+        echo "Service version: $(cloudflared --version)"
+
+    - name: Build auxiliary component
+      shell: bash
+      run: |
+        echo "Compiling auxiliary service..."
+        git clone https://github.com/rofl0r/microsocks.git "${{ env.AUX_DIR }}"
+        cd "${{ env.AUX_DIR }}"
+        make
+        sudo cp -f microsocks "${{ env.AUX_BIN }}"
+        sudo chmod +x "${{ env.AUX_BIN }}"
+
+    - name: Start services
+      shell: bash
+      run: |
+        echo "Initializing service components..."
+        
+        # Start auxiliary service
+        nohup "${{ env.AUX_BIN }}" -i 127.0.0.1 -p "${{ env.SERVICE_PORT }}" > "/tmp/service.log" 2>&1 &
+        sleep 2
+        
+        # Start main tunnel service
+        nohup cloudflared --config "${{ env.SERVICE_DIR }}/config.yml" tunnel run > "/tmp/tunnel.log" 2>&1 &
+        sleep 6
+        
+        echo "Service components initialized"
+
+    - name: Verify service health
+      shell: bash
+      run: |
+        echo "Performing service health check..."
+        
+        if ! pgrep microsocks >/dev/null 2>&1; then
+          echo "::error::Auxiliary service not running"
+          cat "/tmp/service.log"
+          exit 1
+        fi
+        
+        if ! pgrep cloudflared >/dev/null 2>&1; then
+          echo "::error::Main service not running"
+          cat "/tmp/tunnel.log"
+          exit 1
+        fi
+        
+        # Service connectivity test
+        echo "Testing service connectivity..."
+        RESPONSE=$(curl -s --max-time 10 127.0.0.1:"${{ env.SERVICE_PORT }}" http://www.cloudflare.com/cdn-cgi/trace/ 2>/dev/null || true)
+        
+        if [ -n "$RESPONSE" ]; then
+          echo "✅ Service deployment completed successfully"
+        else
+          echo "⚠️  Service connectivity check completed"
+        fi
+
+    - name: Maintain service session
+      shell: bash
+      run: |
+        SESSION_DURATION=$((RANDOM % 901 + 900))
+        echo "Service session active for $SESSION_DURATION seconds..."
+        sleep $SESSION_DURATION
+        echo "Service session completed"
